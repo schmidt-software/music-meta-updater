@@ -5,6 +5,18 @@ updates any files missing cover art or metadata from the internet
 (MusicBrainz + Cover Art Archive via `beets`). Runs fully
 non-interactively.
 
+## Setup
+
+```bash
+cp .env.example .env
+# edit .env: MUSIC_HOST_PATH=<mounted music folder path>, ACOUSTID_API_KEY=<key>
+docker compose up --build
+```
+
+`ACOUSTID_API_KEY` is optional but recommended (free at
+acoustid.org) – without a key, files with completely missing tags can
+only be guessed from the filename, which is much less reliable.
+
 ## Files
 
 - `update_music_metadata.sh` – Main script. Scans all audio files with
@@ -20,18 +32,6 @@ non-interactively.
 - `scan_incomplete.py` – Detection logic (missing cover/tags) used by
   `update_music_metadata.sh`, kept in its own module so it's unit testable.
 - `tests/` – Unit tests for `scan_incomplete.py`.
-
-## Setup
-
-```bash
-cp .env.example .env
-# edit .env: MUSIC_HOST_PATH=<mounted music folder path>, ACOUSTID_API_KEY=<key>
-docker compose up --build
-```
-
-`ACOUSTID_API_KEY` is optional but recommended (free at
-acoustid.org) – without a key, files with completely missing tags can
-only be guessed from the filename, which is much less reliable.
 
 ## Supported mount types
 
