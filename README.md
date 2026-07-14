@@ -30,6 +30,22 @@ docker compose up --build
 acoustid.org) – without a key, files with completely missing tags can
 only be guessed from the filename, which is much less reliable.
 
+## Example
+
+```bash
+# .env
+MUSIC_HOST_PATH=/mnt/music
+ACOUSTID_API_KEY=abcd1234efgh5678
+
+docker compose up --build
+```
+
+Alternatively, run the script directly on the host without Docker:
+
+```bash
+MUSIC_DIR=/mnt/music ACOUSTID_API_KEY=abcd1234efgh5678 ./update_music_metadata.sh
+```
+
 ## Open items / possible next steps
 
 - Recurring execution (cron in the container, or external scheduling)
