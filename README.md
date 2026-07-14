@@ -30,6 +30,28 @@ docker compose up --build
 acoustid.org) – without a key, files with completely missing tags can
 only be guessed from the filename, which is much less reliable.
 
+## Direct invocation (without Docker)
+
+### Installing requirements
+
+System dependencies (Debian/Ubuntu example):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv ffmpeg chromaprint ca-certificates
+```
+
+The script creates its own Python virtual environment under `$WORK_DIR/venv`
+(default `~/.music-metadata-tool/venv`) on first run and installs the
+required Python packages (`beets`, `mutagen`, `requests`, `pyacoustid`) into
+it automatically – no manual `pip install` needed.
+
+### Running
+
+```bash
+MUSIC_DIR=/mnt/music ACOUSTID_API_KEY=abcd1234efgh5678 ./update_music_metadata.sh
+```
+
 ## Example
 
 ```bash
@@ -38,12 +60,6 @@ MUSIC_HOST_PATH=/mnt/music
 ACOUSTID_API_KEY=abcd1234efgh5678
 
 docker compose up --build
-```
-
-Alternatively, run the script directly on the host without Docker:
-
-```bash
-MUSIC_DIR=/mnt/music ACOUSTID_API_KEY=abcd1234efgh5678 ./update_music_metadata.sh
 ```
 
 ## Open items / possible next steps
