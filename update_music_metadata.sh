@@ -2,7 +2,7 @@
 #
 # update_music_metadata.sh
 # ---------------------------------------------------------------------------
-# Recursively scans a (e.g. S3-mounted) music folder and automatically
+# Recursively scans a (e.g. network-mounted) music folder and automatically
 # updates any files missing cover art or basic metadata
 # (title/artist/album) from the internet (MusicBrainz + Cover Art Archive,
 # via "beets").
@@ -27,7 +27,7 @@ set -euo pipefail
 
 # ----------------------------- Configuration --------------------------------
 
-# Path to the (S3-mounted) music folder. Can be overridden via ENV.
+# Path to the (network-mounted) music folder. Can be overridden via ENV.
 MUSIC_DIR="${MUSIC_DIR:-/path/to/music}"
 
 # Optional AcoustID API key for audio fingerprinting (recommended).

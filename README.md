@@ -1,6 +1,6 @@
 # Music Metadata Updater
 
-Recursively scans a (e.g. S3-mounted) music folder and automatically
+Recursively scans a (e.g. network-mounted) music folder and automatically
 updates any files missing cover art or metadata from the internet
 (MusicBrainz + Cover Art Archive via `beets`). Runs fully
 non-interactively.
@@ -22,7 +22,7 @@ non-interactively.
 
 ```bash
 cp .env.example .env
-# edit .env: MUSIC_HOST_PATH=<S3 mount path>, ACOUSTID_API_KEY=<key>
+# edit .env: MUSIC_HOST_PATH=<mounted music folder path>, ACOUSTID_API_KEY=<key>
 docker compose up --build
 ```
 
@@ -37,6 +37,6 @@ only be guessed from the filename, which is much less reliable.
   (`match.strong_rec_thresh` etc.), in case mismatches occur
 - More precise error handling/reporting (currently just a log file at
   `/data/update.log` and `/data/beets_import.log`)
-- Test with real sample files from the S3 mount before running against
+- Test with real sample files from the mounted folder before running against
   the whole library (`MUSIC_HOST_PATH` pointing to a small subfolder
   for testing)

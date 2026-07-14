@@ -1,8 +1,9 @@
 # Usage:
-#   MUSIC_HOST_PATH=/path/to/s3-mount ACOUSTID_API_KEY=xxxxx docker compose up --build
+#   MUSIC_HOST_PATH=/path/to/music-storage ACOUSTID_API_KEY=xxxxx docker compose up --build
 #
-# MUSIC_HOST_PATH  -> path on the host where the S3 mount lives
-#                     (e.g. /mnt/s3-music, where s3fs/goofys/rclone is mounted)
+# MUSIC_HOST_PATH  -> path on the host where the mounted music storage lives
+#                     (e.g. /mnt/music, where a network filesystem like
+#                     s3fs/goofys/rclone/NFS/sshfs is mounted)
 # ACOUSTID_API_KEY -> optional, but recommended for reliable detection
 #                     via audio fingerprinting (free: acoustid.org)
 
@@ -14,7 +15,7 @@ services:
       MUSIC_DIR: /music
       ACOUSTID_API_KEY: ${ACOUSTID_API_KEY:-}
     volumes:
-      # Host's S3 mount is mounted 1:1 into the container.
+      # Host's mounted music storage is mounted 1:1 into the container.
       - ${MUSIC_HOST_PATH:-/path/to/music}:/music
       # Persistent beets database + logs, so later runs don't
       # re-touch files that are already known.
