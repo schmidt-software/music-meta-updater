@@ -149,3 +149,22 @@ def test_find_incomplete(tmp_path, monkeypatch):
     assert str(missing_cover) in incomplete
     assert str(missing_tags) in incomplete
     assert str(corrupt) not in incomplete
+
+
+def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
+    """A transient error listing a subdirectory (common on flaky network
+    mounts) must be reported, not silently swallowed, and must not abort
+    the scan."""
+
+    def fake_walk(path, onerror=None):
+        onerror(OSError("Permission denied: some/subdir"))
+        return iter([])
+
+    monkeypatch.setattr(si.os, "walk", fake_walk)
+
+    total, incomplete = si.find_incomplete(str(tmp_path))
+
+    captured = capsys.readouterr()
+    assert "could not list directory" in captured.err
+    assert total == 0
+    assert incomplete == []

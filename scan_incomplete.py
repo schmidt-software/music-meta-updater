@@ -55,11 +55,18 @@ def has_basic_tags(mf):
     return bool(title) and bool(artist) and bool(album)
 
 
+def _on_walk_error(err):
+    # Network mounts (NFS/SFTP/S3 etc.) can throw transient errors while
+    # listing a directory; report them instead of silently skipping the
+    # subtree (os.walk's default behavior).
+    print(f"WARN: could not list directory ({err})", file=sys.stderr)
+
+
 def find_incomplete(music_dir):
     """Walks music_dir and returns (total_checked, [incomplete_paths])."""
     incomplete = []
     total = 0
-    for root, _dirs, files in os.walk(music_dir):
+    for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in AUDIO_EXTS:

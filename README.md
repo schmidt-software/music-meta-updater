@@ -33,6 +33,32 @@ docker compose up --build
 acoustid.org) – without a key, files with completely missing tags can
 only be guessed from the filename, which is much less reliable.
 
+## Supported mount types
+
+The tool only relies on standard POSIX file operations (directory
+listing, read, write-in-place) on the folder given as `MUSIC_DIR` /
+`MUSIC_HOST_PATH` – it doesn't care how that folder got mounted. It
+works with any mount that shows up as a regular directory, e.g.:
+
+- Object storage mounted as a filesystem (S3 via `s3fs`, `goofys`,
+  `rclone mount`, etc.)
+- NFS
+- SFTP (via `sshfs`)
+- SMB/CIFS
+- Local disks / regular directories
+
+The mount itself must be set up on the Docker **host** before running
+`docker compose up` (see `docker-compose.yml`) – the container only
+bind-mounts the already-mounted host path into `/music`, it never
+performs the mount itself. This keeps the container simple and avoids
+needing extra privileges (e.g. `SYS_ADMIN` / `/dev/fuse`) that
+FUSE-based mounts (s3fs, sshfs, rclone) would otherwise require inside
+the container.
+
+Transient I/O errors while scanning – e.g. a flaky network mount
+timing out while reading a file or listing a directory – are logged as
+warnings and skipped; they don't abort the whole run.
+
 ## Direct invocation (without Docker)
 
 ### Installing requirements
