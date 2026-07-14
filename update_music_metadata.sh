@@ -49,10 +49,25 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
+# Like log(), but for ERROR/WARNING messages: goes to stderr instead of
+# stdout, in addition to LOG_FILE.
+err() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2
+}
+
+# Runs "$@", streaming its stdout/stderr live to the console (debug output
+# and errors stay visible, not just hidden in a log file) while also
+# appending both streams to LOG_FILE for later inspection.
+run_logged() {
+  "$@" \
+    > >(tee -a "$LOG_FILE") \
+    2> >(tee -a "$LOG_FILE" >&2)
+}
+
 # ----------------------------- Pre-checks -----------------------------------
 
 if [ ! -d "$MUSIC_DIR" ]; then
-  log "ERROR: Music folder '$MUSIC_DIR' does not exist or is not mounted."
+  err "ERROR: Music folder '$MUSIC_DIR' does not exist or is not mounted."
   exit 1
 fi
 
@@ -61,7 +76,7 @@ log "Starting metadata/cover update for: $MUSIC_DIR"
 # ----------------------------- Dependencies ---------------------------------
 
 if ! command -v python3 >/dev/null 2>&1; then
-  log "ERROR: python3 is required but not installed."
+  err "ERROR: python3 is required but not installed."
   exit 1
 fi
 
@@ -71,10 +86,10 @@ if ! command -v fpcalc >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     log "fpcalc (chromaprint) not found - attempting automatic install..."
     export DEBIAN_FRONTEND=noninteractive
-    (sudo -n apt-get update -y && sudo -n apt-get install -y chromaprint ffmpeg) \
-      >>"$LOG_FILE" 2>&1 || log "WARNING: Could not automatically install chromaprint (missing sudo rights?). Fingerprinting will be disabled."
+    (run_logged sudo -n apt-get update -y && run_logged sudo -n apt-get install -y chromaprint ffmpeg) \
+      || err "WARNING: Could not automatically install chromaprint (missing sudo rights?). Fingerprinting will be disabled."
   else
-    log "WARNING: fpcalc not found and apt-get not available. Fingerprinting will be disabled."
+    err "WARNING: fpcalc not found and apt-get not available. Fingerprinting will be disabled."
   fi
 fi
 
@@ -86,8 +101,9 @@ fi
 
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
-pip install --quiet --upgrade pip >>"$LOG_FILE" 2>&1
-pip install --quiet --upgrade beets mutagen requests pyacoustid >>"$LOG_FILE" 2>&1
+log "Installing/updating Python dependencies..."
+run_logged pip install --upgrade pip
+run_logged pip install --upgrade beets mutagen requests pyacoustid
 
 USE_CHROMA="no"
 if command -v fpcalc >/dev/null 2>&1 && [ -n "$ACOUSTID_API_KEY" ]; then
@@ -155,7 +171,7 @@ fi
 
 log "Scanning $MUSIC_DIR for files without cover art or metadata..."
 
-python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST"
+run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST"
 
 INCOMPLETE_COUNT=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
 
@@ -176,8 +192,8 @@ log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic 
 while IFS= read -r file; do
   [ -f "$file" ] || continue
   log "Processing: $file"
-  beet -c "$BEETS_CONFIG" import -q -s "$file" >>"$WORK_DIR/beets_import.log" 2>&1 \
-    || log "WARNING: Could not automatically tag '$file' (no confident match found)."
+  run_logged beet -c "$BEETS_CONFIG" import -q -s "$file" \
+    || err "WARNING: Could not automatically tag '$file' (no confident match found)."
 done < "$INCOMPLETE_LIST"
 
 # ----------------------------- Fetch cover art -------------------------------
@@ -185,8 +201,8 @@ done < "$INCOMPLETE_LIST"
 # existing cover are touched.
 
 log "Fetching missing cover art..."
-beet -c "$BEETS_CONFIG" fetchart -q >>"$WORK_DIR/beets_import.log" 2>&1 || true
-beet -c "$BEETS_CONFIG" embedart -q >>"$WORK_DIR/beets_import.log" 2>&1 || true
+run_logged beet -c "$BEETS_CONFIG" fetchart -q || true
+run_logged beet -c "$BEETS_CONFIG" embedart -q || true
 
 deactivate
 

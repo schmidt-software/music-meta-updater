@@ -91,6 +91,17 @@ ACOUSTID_API_KEY=abcd1234efgh5678
 docker compose up --build
 ```
 
+## Logging / console output
+
+The script prints its current status (dependency install, scanning,
+tagging, fetching cover art, ...) to the console as it progresses. Debug
+output from sub-processes (`pip`, `apt-get`, `beet`) is streamed live
+too instead of being hidden away, so you can watch what's happening;
+errors and warnings go to stderr, everything else to stdout. All of it
+is additionally appended to `$WORK_DIR/update.log`
+(default `~/.music-metadata-tool/update.log`, `/data/update.log` in the
+container) for later inspection.
+
 ## Tests
 
 Unit tests cover the detection logic in `scan_incomplete.py` (missing
@@ -107,8 +118,6 @@ pytest tests/
 - Recurring execution (cron in the container, or external scheduling)
 - Finer control over matching thresholds in the beets config
   (`match.strong_rec_thresh` etc.), in case mismatches occur
-- More precise error handling/reporting (currently just a log file at
-  `/data/update.log` and `/data/beets_import.log`)
 - Test with real sample files from the mounted folder before running against
   the whole library (`MUSIC_HOST_PATH` pointing to a small subfolder
   for testing)
