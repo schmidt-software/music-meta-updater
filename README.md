@@ -1,42 +1,42 @@
 # Music Metadata Updater
 
-Durchsucht rekursiv einen (via S3 gemounteten) Musik-Ordner und aktualisiert
-bei allen Dateien ohne Cover oder Metadaten diese automatisch aus dem
-Internet (MusicBrainz + Cover Art Archive via `beets`). Läuft vollständig
-non-interaktiv.
+Recursively scans a (e.g. S3-mounted) music folder and automatically
+updates any files missing cover art or metadata from the internet
+(MusicBrainz + Cover Art Archive via `beets`). Runs fully
+non-interactively.
 
-## Dateien
+## Files
 
-- `update_music_metadata.sh` – Hauptskript. Scannt mit Python/mutagen alle
-  Audiodateien auf fehlende Tags (Titel/Interpret/Album) oder fehlendes
-  Cover, und lässt nur diese Dateien von `beets` automatisch taggen/covern.
-  Verändert keine bereits vollständigen Dateien und verschiebt/benennt
-  nichts um (bestehende Ordnerstruktur bleibt erhalten).
-- `Dockerfile` – Image mit allen Abhängigkeiten (python3, chromaprint/fpcalc,
+- `update_music_metadata.sh` – Main script. Scans all audio files with
+  Python/mutagen for missing tags (title/artist/album) or missing
+  cover art, and only lets `beets` automatically tag/cover those files.
+  Leaves already-complete files untouched and doesn't move/rename
+  anything (existing folder structure is preserved).
+- `Dockerfile` – Image with all dependencies (python3, chromaprint/fpcalc,
   ffmpeg, beets, mutagen, pyacoustid).
-- `docker-compose.yml` – Mountet den Musik-Ordner nach `/music` sowie ein
-  persistentes Volume `/data` für die beets-Datenbank und Logs.
-- `.env.example` – Vorlage für Host-Pfad und AcoustID-Key.
+- `docker-compose.yml` – Mounts the music folder to `/music` plus a
+  persistent volume `/data` for the beets database and logs.
+- `.env.example` – Template for the host path and AcoustID key.
 
 ## Setup
 
 ```bash
 cp .env.example .env
-# .env anpassen: MUSIC_HOST_PATH=<S3-Mount-Pfad>, ACOUSTID_API_KEY=<Key>
+# edit .env: MUSIC_HOST_PATH=<S3 mount path>, ACOUSTID_API_KEY=<key>
 docker compose up --build
 ```
 
-`ACOUSTID_API_KEY` ist optional aber empfohlen (kostenlos unter
-acoustid.org) – ohne Key kann bei komplett fehlenden Tags nur anhand des
-Dateinamens geraten werden, was deutlich unzuverlässiger ist.
+`ACOUSTID_API_KEY` is optional but recommended (free at
+acoustid.org) – without a key, files with completely missing tags can
+only be guessed from the filename, which is much less reliable.
 
-## Offene Punkte / mögliche nächste Schritte
+## Open items / possible next steps
 
-- Wiederkehrende Ausführung (Cron im Container, oder Scheduling extern)
-- Feinere Kontrolle über Matching-Schwellenwerte in der beets-Config
-  (`match.strong_rec_thresh` etc.), falls Fehlzuordnungen auftreten
-- Genauere Fehlerbehandlung/Reporting (aktuell nur Logfile unter
-  `/data/update.log` bzw. `/data/beets_import.log`)
-- Tests mit echten Beispieldateien aus dem S3-Mount, bevor auf die
-  gesamte Bibliothek losgelassen wird (`MUSIC_HOST_PATH` testweise auf
-  einen kleinen Unterordner zeigen lassen)
+- Recurring execution (cron in the container, or external scheduling)
+- Finer control over matching thresholds in the beets config
+  (`match.strong_rec_thresh` etc.), in case mismatches occur
+- More precise error handling/reporting (currently just a log file at
+  `/data/update.log` and `/data/beets_import.log`)
+- Test with real sample files from the S3 mount before running against
+  the whole library (`MUSIC_HOST_PATH` pointing to a small subfolder
+  for testing)

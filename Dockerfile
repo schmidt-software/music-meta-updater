@@ -1,16 +1,16 @@
-# Dockerfile für update_music_metadata.sh
-# Enthält alle Abhängigkeiten: python3, chromaprint/fpcalc, ffmpeg, beets etc.
+# Dockerfile for update_music_metadata.sh
+# Contains all dependencies: python3, chromaprint/fpcalc, ffmpeg, beets etc.
 
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
-# Systemabhängigkeiten:
-# - chromaprint  -> liefert fpcalc für Audio-Fingerprinting (AcoustID)
-# - ffmpeg       -> Audio-Decoding für Fingerprinting/mutagen
-# - python3-venv -> venv-Modul (wird vom Skript verwendet)
-# - ca-certificates -> für HTTPS-Zugriffe auf MusicBrainz/Cover Art Archive
+# System dependencies:
+# - chromaprint  -> provides fpcalc for audio fingerprinting (AcoustID)
+# - ffmpeg       -> audio decoding for fingerprinting/mutagen
+# - python3-venv -> venv module (used by the script)
+# - ca-certificates -> for HTTPS access to MusicBrainz/Cover Art Archive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromaprint \
         ffmpeg \
@@ -23,8 +23,8 @@ WORKDIR /app
 COPY update_music_metadata.sh /app/update_music_metadata.sh
 RUN chmod +x /app/update_music_metadata.sh
 
-# Innerhalb des Containers ist der Musik-Ordner unter /music gemountet,
-# persistente Daten (beets-Datenbank, Logs) liegen unter /data.
+# Inside the container, the music folder is mounted at /music,
+# persistent data (beets database, logs) lives under /data.
 ENV MUSIC_DIR=/music \
     WORK_DIR=/data
 

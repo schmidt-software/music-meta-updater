@@ -2,38 +2,38 @@
 #
 # update_music_metadata.sh
 # ---------------------------------------------------------------------------
-# Durchsucht rekursiv einen (z.B. via S3 gemounteten) Musik-Ordner und
-# aktualisiert bei allen Dateien, denen Cover-Art oder grundlegende
-# Metadaten (Titel/Interpret/Album) fehlen, diese Informationen automatisch
-# aus dem Internet (MusicBrainz + Cover Art Archive, via "beets").
+# Recursively scans a (e.g. S3-mounted) music folder and automatically
+# updates any files missing cover art or basic metadata
+# (title/artist/album) from the internet (MusicBrainz + Cover Art Archive,
+# via "beets").
 #
-# Läuft komplett nicht-interaktiv (keine Rückfragen, keine Prompts).
+# Runs completely non-interactively (no prompts, no confirmations).
 #
-# Benötigt:
+# Requires:
 #   - python3 + pip
-#   - beets (https://beets.io) inkl. Plugins: fetchart, embedart, chroma
-#   - chromaprint/fpcalc (für Audio-Fingerprinting via AcoustID) - optional,
-#     aber DRINGEND empfohlen, da sonst nur nach Dateiname/Ordnername
-#     gesucht werden kann, was deutlich unzuverlässiger ist.
-#   - Ein kostenloser AcoustID API-Key (https://acoustid.org/new-application),
-#     als Umgebungsvariable ACOUSTID_API_KEY übergeben.
+#   - beets (https://beets.io) incl. plugins: fetchart, embedart, chroma
+#   - chromaprint/fpcalc (for audio fingerprinting via AcoustID) - optional,
+#     but STRONGLY recommended, since otherwise only filename/foldername
+#     matching is possible, which is much less reliable.
+#   - A free AcoustID API key (https://acoustid.org/new-application),
+#     passed as the ACOUSTID_API_KEY environment variable.
 #
-# Aufruf:
+# Usage:
 #   MUSIC_DIR=/path/to/music ACOUSTID_API_KEY=xxxxx ./update_music_metadata.sh
 #
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
-# ----------------------------- Konfiguration --------------------------------
+# ----------------------------- Configuration --------------------------------
 
-# Pfad zum (S3-gemounteten) Musik-Ordner. Kann per ENV überschrieben werden.
+# Path to the (S3-mounted) music folder. Can be overridden via ENV.
 MUSIC_DIR="${MUSIC_DIR:-/path/to/music}"
 
-# Optionaler AcoustID API-Key für Audio-Fingerprinting (empfohlen).
+# Optional AcoustID API key for audio fingerprinting (recommended).
 ACOUSTID_API_KEY="${ACOUSTID_API_KEY:-}"
 
-# Arbeitsverzeichnis für venv, beets-Config und Logs.
+# Working directory for venv, beets config and logs.
 WORK_DIR="${WORK_DIR:-$HOME/.music-metadata-tool}"
 VENV_DIR="$WORK_DIR/venv"
 BEETS_CONFIG="$WORK_DIR/beets_config.yaml"
@@ -47,38 +47,38 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-# ----------------------------- Vorprüfungen ---------------------------------
+# ----------------------------- Pre-checks -----------------------------------
 
 if [ ! -d "$MUSIC_DIR" ]; then
-  log "FEHLER: Musik-Ordner '$MUSIC_DIR' existiert nicht oder ist nicht gemountet."
+  log "ERROR: Music folder '$MUSIC_DIR' does not exist or is not mounted."
   exit 1
 fi
 
-log "Starte Metadaten-/Cover-Update für: $MUSIC_DIR"
+log "Starting metadata/cover update for: $MUSIC_DIR"
 
-# ----------------------------- Abhängigkeiten -------------------------------
+# ----------------------------- Dependencies ---------------------------------
 
 if ! command -v python3 >/dev/null 2>&1; then
-  log "FEHLER: python3 wird benötigt, ist aber nicht installiert."
+  log "ERROR: python3 is required but not installed."
   exit 1
 fi
 
-# fpcalc (Chromaprint) für Audio-Fingerprinting, falls möglich automatisch
-# installieren (nur Debian/Ubuntu, nicht-interaktiv).
+# Try to automatically install fpcalc (Chromaprint) for audio fingerprinting,
+# if possible (Debian/Ubuntu only, non-interactive).
 if ! command -v fpcalc >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
-    log "fpcalc (chromaprint) nicht gefunden - versuche automatische Installation..."
+    log "fpcalc (chromaprint) not found - attempting automatic install..."
     export DEBIAN_FRONTEND=noninteractive
     (sudo -n apt-get update -y && sudo -n apt-get install -y chromaprint ffmpeg) \
-      >>"$LOG_FILE" 2>&1 || log "WARNUNG: Konnte chromaprint nicht automatisch installieren (sudo-Rechte fehlen?). Fingerprinting wird deaktiviert."
+      >>"$LOG_FILE" 2>&1 || log "WARNING: Could not automatically install chromaprint (missing sudo rights?). Fingerprinting will be disabled."
   else
-    log "WARNUNG: fpcalc nicht gefunden und kein apt-get verfügbar. Fingerprinting wird deaktiviert."
+    log "WARNING: fpcalc not found and apt-get not available. Fingerprinting will be disabled."
   fi
 fi
 
-# Python venv mit benötigten Paketen anlegen (idempotent).
+# Create Python venv with required packages (idempotent).
 if [ ! -d "$VENV_DIR" ]; then
-  log "Erstelle Python venv unter $VENV_DIR ..."
+  log "Creating Python venv at $VENV_DIR ..."
   python3 -m venv "$VENV_DIR"
 fi
 
@@ -92,18 +92,18 @@ if command -v fpcalc >/dev/null 2>&1 && [ -n "$ACOUSTID_API_KEY" ]; then
   USE_CHROMA="yes"
 fi
 
-# ----------------------------- beets-Konfiguration --------------------------
+# ----------------------------- beets configuration ---------------------------
 #
-# Wichtig:
-#   - move/copy: no  -> Dateien bleiben exakt an ihrem Platz (keine
-#                        Reorganisation der bestehenden Ordnerstruktur)
-#   - write: yes     -> Tags werden in die Dateien geschrieben
-#   - quiet: yes / quiet_fallback: asis -> keine Rückfragen, bei Unsicherheit
-#                        wird die beste automatische Vermutung übernommen
-#   - fetchart/embedart: holen & betten Cover automatisch ein (nur wenn
-#                        noch kein Cover vorhanden ist)
-#   - chroma: Audio-Fingerprinting über AcoustID für zuverlässige Erkennung
-#             auch bei komplett fehlenden Metadaten (nur falls API-Key da)
+# Important:
+#   - move/copy: no  -> files stay exactly in place (no reorganization
+#                        of the existing folder structure)
+#   - write: yes     -> tags are written into the files
+#   - quiet: yes / quiet_fallback: asis -> no prompts, falls back to the
+#                        best automatic guess when uncertain
+#   - fetchart/embedart: automatically fetch & embed cover art (only if
+#                        no cover exists yet)
+#   - chroma: audio fingerprinting via AcoustID for reliable detection
+#             even with completely missing metadata (only if API key is set)
 
 cat > "$BEETS_CONFIG" <<EOF
 directory: $MUSIC_DIR
@@ -144,14 +144,14 @@ acoustid:
 chroma:
   auto: yes
 EOF
-  log "Audio-Fingerprinting (AcoustID/Chromaprint) aktiviert."
+  log "Audio fingerprinting (AcoustID/Chromaprint) enabled."
 else
-  log "Kein AcoustID-Key/fpcalc gefunden - Erkennung erfolgt nur über vorhandene Tags/Dateinamen (weniger zuverlässig)."
+  log "No AcoustID key/fpcalc found - detection will rely only on existing tags/filenames (less reliable)."
 fi
 
-# ----------------------------- Dateien mit fehlenden Daten finden -----------
+# ----------------------------- Find files with missing data -----------------
 
-log "Durchsuche $MUSIC_DIR nach Dateien ohne Cover oder ohne Metadaten..."
+log "Scanning $MUSIC_DIR for files without cover art or metadata..."
 
 python3 - "$MUSIC_DIR" "$INCOMPLETE_LIST" <<'PYEOF'
 import sys, os
@@ -212,10 +212,10 @@ for root, _dirs, files in os.walk(MUSIC_DIR):
         try:
             mf = MutagenFile(path)
         except Exception as e:
-            print(f"WARN: konnte {path} nicht lesen ({e})", file=sys.stderr)
+            print(f"WARN: could not read {path} ({e})", file=sys.stderr)
             continue
         if mf is None:
-            print(f"WARN: unbekanntes/kaputtes Format: {path}", file=sys.stderr)
+            print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
             continue
         missing_cover = not has_cover(mf)
         missing_tags = not has_basic_tags(mf)
@@ -226,40 +226,40 @@ with open(OUT_FILE, "w") as f:
     for p in incomplete:
         f.write(p + "\n")
 
-print(f"{total} Audiodateien geprüft, {len(incomplete)} unvollständig.")
+print(f"{total} audio files checked, {len(incomplete)} incomplete.")
 PYEOF
 
 INCOMPLETE_COUNT=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
 
 if [ "$INCOMPLETE_COUNT" -eq 0 ]; then
-  log "Alle Dateien haben bereits Cover und Metadaten. Nichts zu tun."
+  log "All files already have cover art and metadata. Nothing to do."
   deactivate
   exit 0
 fi
 
-log "$INCOMPLETE_COUNT Datei(en) ohne Cover/Metadaten gefunden. Starte automatisches Tagging..."
+log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic tagging..."
 
-# ----------------------------- Tagging über beets ---------------------------
+# ----------------------------- Tagging via beets -----------------------------
 #
-# Singleton-Modus (-s), da einzelne Dateien (nicht ganze Alben) behandelt
-# werden - so bleiben bereits korrekt getaggte Dateien im selben Ordner
-# unangetastet.
+# Singleton mode (-s), since individual files (not whole albums) are
+# processed - this way already correctly tagged files in the same folder
+# stay untouched.
 
 while IFS= read -r file; do
   [ -f "$file" ] || continue
-  log "Verarbeite: $file"
+  log "Processing: $file"
   beet -c "$BEETS_CONFIG" import -q -s "$file" >>"$WORK_DIR/beets_import.log" 2>&1 \
-    || log "WARNUNG: Konnte '$file' nicht automatisch taggen (kein sicherer Treffer gefunden)."
+    || log "WARNING: Could not automatically tag '$file' (no confident match found)."
 done < "$INCOMPLETE_LIST"
 
-# ----------------------------- Cover nachladen -------------------------------
-# fetchart/embedart laufen mit "force: no" -> es werden nur Alben/Dateien
-# ohne vorhandenes Cover angefasst.
+# ----------------------------- Fetch cover art -------------------------------
+# fetchart/embedart run with "force: no" -> only albums/files without an
+# existing cover are touched.
 
-log "Hole fehlende Cover-Art nach..."
+log "Fetching missing cover art..."
 beet -c "$BEETS_CONFIG" fetchart -q >>"$WORK_DIR/beets_import.log" 2>&1 || true
 beet -c "$BEETS_CONFIG" embedart -q >>"$WORK_DIR/beets_import.log" 2>&1 || true
 
 deactivate
 
-log "Fertig. Details im Log: $WORK_DIR/beets_import.log"
+log "Done. Details in the log: $WORK_DIR/beets_import.log"
