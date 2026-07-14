@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY update_music_metadata.sh /app/update_music_metadata.sh
+COPY scan_incomplete.py /app/scan_incomplete.py
 RUN chmod +x /app/update_music_metadata.sh
 
 # Inside the container, the music folder is mounted at /music,

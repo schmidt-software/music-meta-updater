@@ -17,6 +17,9 @@ non-interactively.
 - `docker-compose.yml` – Mounts the music folder to `/music` plus a
   persistent volume `/data` for the beets database and logs.
 - `.env.example` – Template for the host path and AcoustID key.
+- `scan_incomplete.py` – Detection logic (missing cover/tags) used by
+  `update_music_metadata.sh`, kept in its own module so it's unit testable.
+- `tests/` – Unit tests for `scan_incomplete.py`.
 
 ## Setup
 
@@ -60,6 +63,17 @@ MUSIC_HOST_PATH=/mnt/music
 ACOUSTID_API_KEY=abcd1234efgh5678
 
 docker compose up --build
+```
+
+## Tests
+
+Unit tests cover the detection logic in `scan_incomplete.py` (missing
+cover art / missing tags / directory scan) with mocked mutagen objects,
+so they run without needing real audio files.
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
 ```
 
 ## Open items / possible next steps
