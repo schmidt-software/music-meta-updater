@@ -1,0 +1,25 @@
+# Aufruf:
+#   MUSIC_HOST_PATH=/pfad/zum/s3-mount ACOUSTID_API_KEY=xxxxx docker compose up --build
+#
+# MUSIC_HOST_PATH  -> Pfad auf dem Host, unter dem der S3-Mount liegt
+#                     (z.B. /mnt/s3-music, wo s3fs/goofys/rclone eingehängt ist)
+# ACOUSTID_API_KEY -> optional, aber empfohlen für zuverlässige Erkennung
+#                     via Audio-Fingerprinting (kostenlos: acoustid.org)
+
+services:
+  music-metadata-updater:
+    build: .
+    container_name: music-metadata-updater
+    environment:
+      MUSIC_DIR: /music
+      ACOUSTID_API_KEY: ${ACOUSTID_API_KEY:-}
+    volumes:
+      # S3-Mount des Hosts wird 1:1 in den Container gemountet.
+      - ${MUSIC_HOST_PATH:-/path/to/music}:/music
+      # Persistente beets-Datenbank + Logs, damit spätere Läufe
+      # bereits bekannte Dateien nicht erneut anfassen.
+      - music_metadata_data:/data
+    restart: "no"
+
+volumes:
+  music_metadata_data:

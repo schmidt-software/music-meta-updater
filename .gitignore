@@ -1,0 +1,7 @@
+.env
+venv/
+*.log
+data/
+.music-metadata-tool/
+__pycache__/
+*.pyc
