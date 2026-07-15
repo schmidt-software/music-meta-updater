@@ -162,16 +162,21 @@ def test_count_audio_files(tmp_path):
 # --------------------------- _print_progress -----------------------------
 
 
-def test_print_progress_renders_bar(capsys):
-    si._print_progress(5, 10, width=10)
-    out = capsys.readouterr().out
-    assert out.startswith("\r[")
-    assert "5/10" in out
-    assert "50.0%" in out
+def test_print_progress_prints_on_percent_change(capsys):
+    last_pct = si._print_progress(1, 10, -1)
+    assert last_pct == 10
+    assert capsys.readouterr().out == "Scanning: 1/10 (10%)\n"
+
+
+def test_print_progress_skips_when_percent_unchanged(capsys):
+    last_pct = si._print_progress(50, 1000, 5)
+    assert last_pct == 5
+    assert capsys.readouterr().out == ""
 
 
 def test_print_progress_noop_when_total_zero(capsys):
-    si._print_progress(0, 0)
+    last_pct = si._print_progress(0, 0, -1)
+    assert last_pct == -1
     assert capsys.readouterr().out == ""
 
 

@@ -73,13 +73,21 @@ def count_audio_files(music_dir):
     return total
 
 
-def _print_progress(done, total, width=30):
+def _print_progress(done, total, last_pct):
+    """Prints a "done/total (pct%)" line whenever the percentage advances.
+
+    Uses a plain newline rather than an in-place "\r"-updated bar: the scan
+    runs through update_music_metadata.sh's run_logged/tee pipeline inside a
+    non-tty Docker container, where carriage-return updates get swallowed
+    instead of rendered.
+    """
     if total <= 0:
-        return
-    frac = min(done / total, 1.0)
-    filled = int(width * frac)
-    bar = "#" * filled + "-" * (width - filled)
-    print(f"\r[{bar}] {done}/{total} ({frac * 100:5.1f}%)", end="", flush=True)
+        return last_pct
+    pct = done * 100 // total
+    if pct != last_pct or done == total:
+        print(f"Scanning: {done}/{total} ({pct}%)")
+        last_pct = pct
+    return last_pct
 
 
 def find_incomplete(music_dir):
@@ -87,6 +95,7 @@ def find_incomplete(music_dir):
     total = count_audio_files(music_dir)
     incomplete = []
     checked = 0
+    last_pct = -1
     for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
@@ -97,22 +106,19 @@ def find_incomplete(music_dir):
                 mf = MutagenFile(path)
             except Exception as e:
                 print(f"WARN: could not read {path} ({e})", file=sys.stderr)
-                checked += 1
-                _print_progress(checked, total)
-                continue
-            if mf is None:
-                print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
-                checked += 1
-                _print_progress(checked, total)
-                continue
-            missing_cover = not has_cover(mf)
-            missing_tags = not has_basic_tags(mf)
-            if missing_cover or missing_tags:
-                incomplete.append(path)
+                mf = None
+            else:
+                if mf is None:
+                    print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
+
+            if mf is not None:
+                missing_cover = not has_cover(mf)
+                missing_tags = not has_basic_tags(mf)
+                if missing_cover or missing_tags:
+                    incomplete.append(path)
+
             checked += 1
-            _print_progress(checked, total)
-    if total:
-        print()
+            last_pct = _print_progress(checked, total, last_pct)
     return checked, incomplete
 
 
