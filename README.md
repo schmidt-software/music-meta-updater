@@ -5,6 +5,12 @@ updates any files missing cover art or metadata from the internet
 (MusicBrainz + Cover Art Archive via `beets`). Runs fully
 non-interactively.
 
+Scanning checks multiple files concurrently (`SCAN_WORKERS`, default 8 -
+tune this up on high-latency network mounts where each file check is a
+network round trip), and each file gets tagged/cover-art-updated the
+moment it's found incomplete, rather than waiting for the whole scan to
+finish first.
+
 ## Setup
 
 ```bash
@@ -19,18 +25,23 @@ only be guessed from the filename, which is much less reliable.
 
 ## Files
 
-- `update_music_metadata.sh` – Main script. Scans all audio files with
-  Python/mutagen for missing tags (title/artist/album) or missing
-  cover art, and only lets `beets` automatically tag/cover those files.
-  Leaves already-complete files untouched and doesn't move/rename
+- `update_music_metadata.sh` – Main script. Sets up the Python venv and
+  beets config, then hands off to `scan_incomplete.py` for scanning and
+  tagging. Leaves already-complete files untouched and doesn't move/rename
   anything (existing folder structure is preserved).
 - `Dockerfile` – Image with all dependencies (python3, chromaprint/fpcalc,
   ffmpeg, beets, mutagen, pyacoustid).
 - `docker-compose.yml` – Mounts the music folder to `/music` plus a
   persistent volume `/data` for the beets database and logs.
 - `.env.example` – Template for the host path and AcoustID key.
-- `scan_incomplete.py` – Detection logic (missing cover/tags) used by
-  `update_music_metadata.sh`, kept in its own module so it's unit testable.
+- `scan_incomplete.py` – Scans all audio files with Python/mutagen for
+  missing tags (title/artist/album) or missing cover art (`has_cover`,
+  `has_basic_tags`), checking multiple files concurrently via a thread
+  pool. The moment a file is found incomplete, it's handed to a single
+  update worker thread that runs `beet import` (tagging) then `beet
+  fetchart`/`embedart` scoped to just that file (`path:<file>`) - so
+  updates start immediately instead of waiting for the whole scan to
+  finish. Kept in its own module so the logic is unit testable.
 - `tests/` – Unit tests for `scan_incomplete.py`.
 
 ## Supported mount types

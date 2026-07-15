@@ -6,6 +6,10 @@
 #                     s3fs/goofys/rclone/NFS/sshfs is mounted)
 # ACOUSTID_API_KEY -> optional, but recommended for reliable detection
 #                     via audio fingerprinting (free: acoustid.org)
+# SCAN_WORKERS     -> optional, number of files checked concurrently while
+#                     scanning (default 8) - raise this on high-latency
+#                     network mounts where each file check is a network
+#                     round trip
 
 services:
   music-metadata-updater:
@@ -14,6 +18,7 @@ services:
     environment:
       MUSIC_DIR: /music
       ACOUSTID_API_KEY: ${ACOUSTID_API_KEY:-}
+      SCAN_WORKERS: ${SCAN_WORKERS:-8}
     volumes:
       # Host's mounted music storage is mounted 1:1 into the container.
       - ${MUSIC_HOST_PATH:-/path/to/music}:/music

@@ -167,46 +167,17 @@ else
   log "No AcoustID key/fpcalc found - detection will rely only on existing tags/filenames (less reliable)."
 fi
 
-# ----------------------------- Find files with missing data -----------------
-
-log "Scanning $MUSIC_DIR for files without cover art or metadata..."
-
-run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST"
-
-INCOMPLETE_COUNT=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
-
-if [ "$INCOMPLETE_COUNT" -eq 0 ]; then
-  log "All files already have cover art and metadata. Nothing to do."
-  deactivate
-  exit 0
-fi
-
-log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic tagging..."
-
-# ----------------------------- Tagging via beets -----------------------------
+# ----------------------------- Scan + update ---------------------------------
 #
-# Singleton mode (-s), since individual files (not whole albums) are
-# processed - this way already correctly tagged files in the same folder
-# stay untouched.
+# scan_incomplete.py checks files for missing cover art/tags with a pool of
+# worker threads (SCAN_WORKERS, default 8 - I/O-bound, so concurrency helps
+# a lot on network mounts) and, the moment a file is found incomplete,
+# hands it to beets (import -s, then fetchart/embedart scoped to just that
+# item) right away instead of waiting for the whole scan to finish first.
 
-while IFS= read -r file; do
-  [ -f "$file" ] || continue
-  log "Fetching metadata for: $file"
-  if run_logged beet -v -c "$BEETS_CONFIG" import -q -s "$file"; then
-    log "Metadata written: $file"
-  else
-    err "WARNING: Could not automatically tag '$file' (no confident match found)."
-  fi
-done < "$INCOMPLETE_LIST"
+log "Scanning $MUSIC_DIR for files without cover art or metadata, updating as they're found..."
 
-# ----------------------------- Fetch cover art -------------------------------
-# fetchart/embedart run with "force: no" -> only albums/files without an
-# existing cover are touched.
-
-log "Fetching missing cover art from Cover Art Archive..."
-run_logged beet -v -c "$BEETS_CONFIG" fetchart -q || true
-log "Embedding fetched cover art into files..."
-run_logged beet -v -c "$BEETS_CONFIG" embedart -y || true
+run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST" "$BEETS_CONFIG"
 
 deactivate
 

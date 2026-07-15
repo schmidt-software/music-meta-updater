@@ -37,8 +37,22 @@ def test_has_cover_mp4_covr():
     assert si.has_cover(mf) is True
 
 
+def test_has_cover_wma_picture():
+    mf = FakeMF(tags=FakeTags({"WM/Picture": [b"..."]}))
+    assert si.has_cover(mf) is True
+
+
 def test_has_cover_flac_pictures():
     mf = FakeMF(tags=FakeTags({}), pictures=["picture-data"])
+    assert si.has_cover(mf) is True
+
+
+def test_has_cover_flac_pictures_without_any_tags_block():
+    """A FLAC with an embedded picture but zero VORBIS_COMMENT tags has
+    mf.tags is None (confirmed against real mutagen.flac.FLAC) - the
+    pictures check must not be nested inside a "tags is not None" guard,
+    or files like this are wrongly reported as missing a cover."""
+    mf = FakeMF(tags=None, pictures=["picture-data"])
     assert si.has_cover(mf) is True
 
 
@@ -105,10 +119,146 @@ def test_has_basic_tags_no_tags():
     assert si.has_basic_tags(mf) is False
 
 
-# --------------------------- find_incomplete -----------------------------
+# ----------------------------- _check_file -------------------------------
 
 
-def test_find_incomplete(tmp_path, monkeypatch):
+def test_check_file_ok(monkeypatch):
+    mf = FakeMF(tags=FakeTags({
+        "APIC:cover": b"...",
+        "title": ["T"], "artist": ["A"], "album": ["Al"],
+    }))
+    monkeypatch.setattr(si, "MutagenFile", lambda path: mf)
+    assert si._check_file("/music/song.mp3") == ("ok", None)
+
+
+def test_check_file_incomplete_missing_cover(monkeypatch):
+    mf = FakeMF(tags=FakeTags({"title": ["T"], "artist": ["A"], "album": ["Al"]}))
+    monkeypatch.setattr(si, "MutagenFile", lambda path: mf)
+    assert si._check_file("/music/song.mp3") == ("incomplete", None)
+
+
+def test_check_file_warns_on_read_error(monkeypatch):
+    def raising(path):
+        raise ValueError("cannot parse")
+    monkeypatch.setattr(si, "MutagenFile", raising)
+    kind, msg = si._check_file("/music/corrupt.mp3")
+    assert kind == "warn"
+    assert "could not read" in msg
+
+
+def test_check_file_warns_on_unknown_format(monkeypatch):
+    monkeypatch.setattr(si, "MutagenFile", lambda path: None)
+    kind, msg = si._check_file("/music/weird.mp3")
+    assert kind == "warn"
+    assert "unknown/corrupt format" in msg
+
+
+# ----------------------------- _update_file -------------------------------
+
+
+class FakeCompletedProcess:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+def test_update_file_success_runs_import_fetchart_embedart():
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return FakeCompletedProcess(0)
+
+    ok = si._update_file("/music/song.mp3", "/data/beets_config.yaml", run=fake_run)
+
+    assert ok is True
+    assert calls[0] == ["beet", "-v", "-c", "/data/beets_config.yaml",
+                         "import", "-q", "-s", "/music/song.mp3"]
+    assert calls[1] == ["beet", "-v", "-c", "/data/beets_config.yaml",
+                         "fetchart", "-q", "path:/music/song.mp3"]
+    assert calls[2] == ["beet", "-v", "-c", "/data/beets_config.yaml",
+                         "embedart", "-y", "path:/music/song.mp3"]
+
+
+def test_update_file_import_failure_skips_fetchart_embedart(capsys):
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return FakeCompletedProcess(1)
+
+    ok = si._update_file("/music/song.mp3", "/data/beets_config.yaml", run=fake_run)
+
+    assert ok is False
+    assert len(calls) == 1
+    assert "Could not automatically tag" in capsys.readouterr().err
+
+
+# --------------------------- _updater_worker ------------------------------
+
+
+def test_updater_worker_processes_queue_until_sentinel():
+    import queue as queue_mod
+
+    work_queue = queue_mod.Queue()
+    work_queue.put("/music/a.mp3")
+    work_queue.put("/music/b.mp3")
+    work_queue.put(None)
+
+    processed = []
+
+    def fake_update(file_path, beets_config_path):
+        processed.append(file_path)
+        return file_path != "/music/b.mp3"  # simulate one success, one failure
+
+    state = {"updated": 0, "failed": 0}
+    si._updater_worker(work_queue, "/data/beets_config.yaml", state, update_fn=fake_update)
+
+    assert processed == ["/music/a.mp3", "/music/b.mp3"]
+    assert state["updated"] == 1
+    assert state["failed"] == 1
+
+
+# ----------------------------- _heartbeat ---------------------------------
+
+
+class FakeStopEvent:
+    """Stands in for threading.Event: wait() returns the next canned value
+    instead of actually sleeping, so the heartbeat loop can be driven
+    deterministically without real threads/timing."""
+
+    def __init__(self, wait_returns):
+        self._returns = iter(wait_returns)
+
+    def wait(self, timeout):
+        return next(self._returns)
+
+
+def test_heartbeat_prints_once_per_tick(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 105.0)
+    state = {"checked": 42, "incomplete": 3, "updated": 2, "failed": 1}
+    stop_event = FakeStopEvent([False, False, True])
+
+    si._heartbeat(state, stop_event, start_time=100.0, interval=5.0)
+
+    out = capsys.readouterr().out
+    expected = ("Scanning: 42 files checked so far "
+                "(3 incomplete found, 2 updated, 1 failed, 5s elapsed)\n")
+    assert out == expected * 2
+
+
+def test_heartbeat_stops_immediately_when_event_already_set(capsys):
+    state = {"checked": 0, "incomplete": 0, "updated": 0, "failed": 0}
+    stop_event = FakeStopEvent([True])
+
+    si._heartbeat(state, stop_event, start_time=100.0)
+
+    assert capsys.readouterr().out == ""
+
+
+# --------------------------- scan_and_update ------------------------------
+
+
+def test_scan_and_update(tmp_path, monkeypatch):
     complete = tmp_path / "complete.mp3"
     complete.write_bytes(b"")
     missing_cover = tmp_path / "missing_cover.mp3"
@@ -142,84 +292,30 @@ def test_find_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
-    total, incomplete = si.find_incomplete(str(tmp_path))
+    updated_paths = []
 
-    assert total == 4  # all *.mp3/*.flac files, txt excluded
+    def fake_update_file(file_path, beets_config_path, run=None):
+        updated_paths.append(file_path)
+        return True
+
+    monkeypatch.setattr(si, "_update_file", fake_update_file)
+
+    out_file = tmp_path / "incomplete.lst"
+    checked, incomplete, updated, failed = si.scan_and_update(
+        str(tmp_path), "/data/beets_config.yaml", str(out_file), max_scan_workers=2)
+
+    assert checked == 4  # all *.mp3/*.flac files, txt excluded
     assert str(complete) not in incomplete
     assert str(missing_cover) in incomplete
     assert str(missing_tags) in incomplete
     assert str(corrupt) not in incomplete
+    assert sorted(updated_paths) == sorted([str(missing_cover), str(missing_tags)])
+    assert updated == 2
+    assert failed == 0
+    assert set(out_file.read_text().splitlines()) == {str(missing_cover), str(missing_tags)}
 
 
-# ----------------------------- _heartbeat ---------------------------------
-
-
-class FakeStopEvent:
-    """Stands in for threading.Event: wait() returns the next canned value
-    instead of actually sleeping, so the heartbeat loop can be driven
-    deterministically without real threads/timing."""
-
-    def __init__(self, wait_returns):
-        self._returns = iter(wait_returns)
-
-    def wait(self, timeout):
-        return next(self._returns)
-
-
-def test_heartbeat_prints_once_per_tick(capsys, monkeypatch):
-    monkeypatch.setattr(si.time, "monotonic", lambda: 105.0)
-    state = {"checked": 42, "incomplete": 3}
-    stop_event = FakeStopEvent([False, False, True])
-
-    si._heartbeat(state, stop_event, start_time=100.0, interval=5.0)
-
-    out = capsys.readouterr().out
-    assert out == (
-        "Scanning: 42 files checked so far (3 incomplete, 5s elapsed)\n"
-        "Scanning: 42 files checked so far (3 incomplete, 5s elapsed)\n"
-    )
-
-
-def test_heartbeat_stops_immediately_when_event_already_set(capsys):
-    state = {"checked": 0, "incomplete": 0}
-    stop_event = FakeStopEvent([True])
-
-    si._heartbeat(state, stop_event, start_time=100.0)
-
-    assert capsys.readouterr().out == ""
-
-
-def test_find_incomplete_starts_and_stops_heartbeat_thread(tmp_path, monkeypatch):
-    (tmp_path / "song.mp3").write_bytes(b"")
-    monkeypatch.setattr(si, "MutagenFile", lambda path: None)
-
-    created_threads = []
-
-    class FakeThread:
-        def __init__(self, target=None, args=(), daemon=None):
-            self.daemon = daemon
-            self.started = False
-            self.joined = False
-            created_threads.append(self)
-
-        def start(self):
-            self.started = True
-
-        def join(self):
-            self.joined = True
-
-    monkeypatch.setattr(si.threading, "Thread", FakeThread)
-
-    si.find_incomplete(str(tmp_path))
-
-    assert len(created_threads) == 1
-    thread = created_threads[0]
-    assert thread.daemon is True
-    assert thread.started is True
-    assert thread.joined is True
-
-
-def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
+def test_scan_and_update_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
     """A transient error listing a subdirectory (common on flaky network
     mounts) must be reported, not silently swallowed, and must not abort
     the scan."""
@@ -230,9 +326,13 @@ def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch,
 
     monkeypatch.setattr(si.os, "walk", fake_walk)
 
-    total, incomplete = si.find_incomplete(str(tmp_path))
+    out_file = tmp_path / "incomplete.lst"
+    checked, incomplete, updated, failed = si.scan_and_update(
+        str(tmp_path), "/data/beets_config.yaml", str(out_file))
 
     captured = capsys.readouterr()
     assert "could not list directory" in captured.err
-    assert total == 0
+    assert checked == 0
     assert incomplete == []
+    assert updated == 0
+    assert failed == 0
