@@ -191,18 +191,22 @@ log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic 
 
 while IFS= read -r file; do
   [ -f "$file" ] || continue
-  log "Processing: $file"
-  run_logged beet -c "$BEETS_CONFIG" import -q -s "$file" \
-    || err "WARNING: Could not automatically tag '$file' (no confident match found)."
+  log "Fetching metadata for: $file"
+  if run_logged beet -v -c "$BEETS_CONFIG" import -q -s "$file"; then
+    log "Metadata written: $file"
+  else
+    err "WARNING: Could not automatically tag '$file' (no confident match found)."
+  fi
 done < "$INCOMPLETE_LIST"
 
 # ----------------------------- Fetch cover art -------------------------------
 # fetchart/embedart run with "force: no" -> only albums/files without an
 # existing cover are touched.
 
-log "Fetching missing cover art..."
-run_logged beet -c "$BEETS_CONFIG" fetchart -q || true
-run_logged beet -c "$BEETS_CONFIG" embedart -q || true
+log "Fetching missing cover art from Cover Art Archive..."
+run_logged beet -v -c "$BEETS_CONFIG" fetchart -q || true
+log "Embedding fetched cover art into files..."
+run_logged beet -v -c "$BEETS_CONFIG" embedart -y || true
 
 deactivate
 
