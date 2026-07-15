@@ -60,8 +60,8 @@ err() {
 # appending both streams to LOG_FILE for later inspection.
 run_logged() {
   "$@" \
-    > >(tee -a "$LOG_FILE") \
-    2> >(tee -a "$LOG_FILE" >&2)
+    > >(stdbuf -oL tee -a "$LOG_FILE") \
+    2> >(stdbuf -oL tee -a "$LOG_FILE" >&2)
 }
 
 # ----------------------------- Pre-checks -----------------------------------

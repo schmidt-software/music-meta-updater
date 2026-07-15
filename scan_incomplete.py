@@ -6,6 +6,7 @@ detection logic can be unit tested independently of the shell script.
 """
 import sys
 import os
+import time
 from mutagen import File as MutagenFile
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
@@ -62,41 +63,35 @@ def _on_walk_error(err):
     print(f"WARN: could not list directory ({err})", file=sys.stderr)
 
 
-def count_audio_files(music_dir):
-    """Cheap pre-pass (extension check only, no file parsing) to get a total
-    for the progress bar in find_incomplete()."""
-    total = 0
-    for _root, _dirs, files in os.walk(music_dir, onerror=lambda err: None):
-        for fname in files:
-            if os.path.splitext(fname)[1].lower() in AUDIO_EXTS:
-                total += 1
-    return total
+def _print_progress(checked, incomplete_count, start_time, last_print_time,
+                     count_interval=100, time_interval=5.0):
+    """Prints a "checked so far" status line every count_interval files or
+    every time_interval seconds, whichever comes first.
 
-
-def _print_progress(done, total, last_pct):
-    """Prints a "done/total (pct%)" line whenever the percentage advances.
-
-    Uses a plain newline rather than an in-place "\r"-updated bar: the scan
-    runs through update_music_metadata.sh's run_logged/tee pipeline inside a
-    non-tty Docker container, where carriage-return updates get swallowed
-    instead of rendered.
+    No total/percentage: computing one would need a full pre-pass walk of
+    music_dir, which on network mounts (NFS/SFTP/S3/SMB) can be as slow as
+    the scan itself and would leave the scan silent until it finished. This
+    also always calls print(..., flush=True) instead of relying on the
+    Dockerfile's PYTHONUNBUFFERED=1 to reach the console through
+    update_music_metadata.sh's run_logged/tee pipeline.
     """
-    if total <= 0:
-        return last_pct
-    pct = done * 100 // total
-    if pct != last_pct or done == total:
-        print(f"Scanning: {done}/{total} ({pct}%)")
-        last_pct = pct
-    return last_pct
+    now = time.monotonic()
+    if checked and (checked % count_interval == 0 or now - last_print_time >= time_interval):
+        elapsed = now - start_time
+        print(f"Scanning: {checked} files checked so far "
+              f"({incomplete_count} incomplete, {elapsed:.0f}s elapsed)", flush=True)
+        return now
+    return last_print_time
 
 
 def find_incomplete(music_dir):
     """Walks music_dir and returns (total_checked, [incomplete_paths])."""
-    total = count_audio_files(music_dir)
     incomplete = []
     checked = 0
-    last_pct = -1
+    start_time = time.monotonic()
+    last_print_time = start_time
     for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
+        last_print_time = _print_progress(checked, len(incomplete), start_time, last_print_time)
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in AUDIO_EXTS:
@@ -105,11 +100,11 @@ def find_incomplete(music_dir):
             try:
                 mf = MutagenFile(path)
             except Exception as e:
-                print(f"WARN: could not read {path} ({e})", file=sys.stderr)
+                print(f"WARN: could not read {path} ({e})", file=sys.stderr, flush=True)
                 mf = None
             else:
                 if mf is None:
-                    print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
+                    print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr, flush=True)
 
             if mf is not None:
                 missing_cover = not has_cover(mf)
@@ -118,7 +113,7 @@ def find_incomplete(music_dir):
                     incomplete.append(path)
 
             checked += 1
-            last_pct = _print_progress(checked, total, last_pct)
+            last_print_time = _print_progress(checked, len(incomplete), start_time, last_print_time)
     return checked, incomplete
 
 
@@ -128,7 +123,7 @@ def main():
     with open(out_file, "w") as f:
         for p in incomplete:
             f.write(p + "\n")
-    print(f"{total} audio files checked, {len(incomplete)} incomplete.")
+    print(f"{total} audio files checked, {len(incomplete)} incomplete.", flush=True)
 
 
 if __name__ == "__main__":

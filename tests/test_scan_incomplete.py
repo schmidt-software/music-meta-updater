@@ -151,32 +151,37 @@ def test_find_incomplete(tmp_path, monkeypatch):
     assert str(corrupt) not in incomplete
 
 
-def test_count_audio_files(tmp_path):
-    (tmp_path / "a.mp3").write_bytes(b"")
-    (tmp_path / "b.flac").write_bytes(b"")
-    (tmp_path / "notes.txt").write_text("not audio")
-
-    assert si.count_audio_files(str(tmp_path)) == 2
-
-
 # --------------------------- _print_progress -----------------------------
 
 
-def test_print_progress_prints_on_percent_change(capsys):
-    last_pct = si._print_progress(1, 10, -1)
-    assert last_pct == 10
-    assert capsys.readouterr().out == "Scanning: 1/10 (10%)\n"
+def test_print_progress_prints_at_count_interval(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 100.0)
+    last_print_time = si._print_progress(100, 7, start_time=90.0, last_print_time=90.0,
+                                          count_interval=100, time_interval=5.0)
+    assert last_print_time == 100.0
+    assert capsys.readouterr().out == "Scanning: 100 files checked so far (7 incomplete, 10s elapsed)\n"
 
 
-def test_print_progress_skips_when_percent_unchanged(capsys):
-    last_pct = si._print_progress(50, 1000, 5)
-    assert last_pct == 5
+def test_print_progress_suppressed_between_boundaries(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 92.0)
+    last_print_time = si._print_progress(150, 3, start_time=90.0, last_print_time=90.0,
+                                          count_interval=100, time_interval=5.0)
+    assert last_print_time == 90.0
     assert capsys.readouterr().out == ""
 
 
-def test_print_progress_noop_when_total_zero(capsys):
-    last_pct = si._print_progress(0, 0, -1)
-    assert last_pct == -1
+def test_print_progress_prints_early_when_time_interval_elapsed(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 96.0)
+    last_print_time = si._print_progress(150, 3, start_time=90.0, last_print_time=90.0,
+                                          count_interval=100, time_interval=5.0)
+    assert last_print_time == 96.0
+    assert capsys.readouterr().out == "Scanning: 150 files checked so far (3 incomplete, 6s elapsed)\n"
+
+
+def test_print_progress_noop_when_checked_zero(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 100.0)
+    last_print_time = si._print_progress(0, 0, start_time=90.0, last_print_time=90.0)
+    assert last_print_time == 90.0
     assert capsys.readouterr().out == ""
 
 
