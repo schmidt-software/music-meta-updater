@@ -62,30 +62,58 @@ def _on_walk_error(err):
     print(f"WARN: could not list directory ({err})", file=sys.stderr)
 
 
+def count_audio_files(music_dir):
+    """Cheap pre-pass (extension check only, no file parsing) to get a total
+    for the progress bar in find_incomplete()."""
+    total = 0
+    for _root, _dirs, files in os.walk(music_dir, onerror=lambda err: None):
+        for fname in files:
+            if os.path.splitext(fname)[1].lower() in AUDIO_EXTS:
+                total += 1
+    return total
+
+
+def _print_progress(done, total, width=30):
+    if total <= 0:
+        return
+    frac = min(done / total, 1.0)
+    filled = int(width * frac)
+    bar = "#" * filled + "-" * (width - filled)
+    print(f"\r[{bar}] {done}/{total} ({frac * 100:5.1f}%)", end="", flush=True)
+
+
 def find_incomplete(music_dir):
     """Walks music_dir and returns (total_checked, [incomplete_paths])."""
+    total = count_audio_files(music_dir)
     incomplete = []
-    total = 0
+    checked = 0
     for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in AUDIO_EXTS:
                 continue
-            total += 1
             path = os.path.join(root, fname)
             try:
                 mf = MutagenFile(path)
             except Exception as e:
                 print(f"WARN: could not read {path} ({e})", file=sys.stderr)
+                checked += 1
+                _print_progress(checked, total)
                 continue
             if mf is None:
                 print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
+                checked += 1
+                _print_progress(checked, total)
                 continue
             missing_cover = not has_cover(mf)
             missing_tags = not has_basic_tags(mf)
             if missing_cover or missing_tags:
                 incomplete.append(path)
-    return total, incomplete
+            checked += 1
+            _print_progress(checked, total)
+    if total:
+        print()
+    return checked, incomplete
 
 
 def main():

@@ -151,6 +151,30 @@ def test_find_incomplete(tmp_path, monkeypatch):
     assert str(corrupt) not in incomplete
 
 
+def test_count_audio_files(tmp_path):
+    (tmp_path / "a.mp3").write_bytes(b"")
+    (tmp_path / "b.flac").write_bytes(b"")
+    (tmp_path / "notes.txt").write_text("not audio")
+
+    assert si.count_audio_files(str(tmp_path)) == 2
+
+
+# --------------------------- _print_progress -----------------------------
+
+
+def test_print_progress_renders_bar(capsys):
+    si._print_progress(5, 10, width=10)
+    out = capsys.readouterr().out
+    assert out.startswith("\r[")
+    assert "5/10" in out
+    assert "50.0%" in out
+
+
+def test_print_progress_noop_when_total_zero(capsys):
+    si._print_progress(0, 0)
+    assert capsys.readouterr().out == ""
+
+
 def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
     """A transient error listing a subdirectory (common on flaky network
     mounts) must be reported, not silently swallowed, and must not abort
