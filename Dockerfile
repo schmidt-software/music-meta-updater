@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # - python3-venv -> venv module (used by the script)
 # - ca-certificates -> for HTTPS access to MusicBrainz/Cover Art Archive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromaprint \
+        libchromaprint-tools \
         ffmpeg \
         python3-venv \
         ca-certificates \
