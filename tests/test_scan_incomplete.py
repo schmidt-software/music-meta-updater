@@ -151,38 +151,72 @@ def test_find_incomplete(tmp_path, monkeypatch):
     assert str(corrupt) not in incomplete
 
 
-# --------------------------- _print_progress -----------------------------
+# ----------------------------- _heartbeat ---------------------------------
 
 
-def test_print_progress_prints_at_count_interval(capsys, monkeypatch):
-    monkeypatch.setattr(si.time, "monotonic", lambda: 100.0)
-    last_print_time = si._print_progress(100, 7, start_time=90.0, last_print_time=90.0,
-                                          count_interval=100, time_interval=5.0)
-    assert last_print_time == 100.0
-    assert capsys.readouterr().out == "Scanning: 100 files checked so far (7 incomplete, 10s elapsed)\n"
+class FakeStopEvent:
+    """Stands in for threading.Event: wait() returns the next canned value
+    instead of actually sleeping, so the heartbeat loop can be driven
+    deterministically without real threads/timing."""
+
+    def __init__(self, wait_returns):
+        self._returns = iter(wait_returns)
+
+    def wait(self, timeout):
+        return next(self._returns)
 
 
-def test_print_progress_suppressed_between_boundaries(capsys, monkeypatch):
-    monkeypatch.setattr(si.time, "monotonic", lambda: 92.0)
-    last_print_time = si._print_progress(150, 3, start_time=90.0, last_print_time=90.0,
-                                          count_interval=100, time_interval=5.0)
-    assert last_print_time == 90.0
+def test_heartbeat_prints_once_per_tick(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 105.0)
+    state = {"checked": 42, "incomplete": 3}
+    stop_event = FakeStopEvent([False, False, True])
+
+    si._heartbeat(state, stop_event, start_time=100.0, interval=5.0)
+
+    out = capsys.readouterr().out
+    assert out == (
+        "Scanning: 42 files checked so far (3 incomplete, 5s elapsed)\n"
+        "Scanning: 42 files checked so far (3 incomplete, 5s elapsed)\n"
+    )
+
+
+def test_heartbeat_stops_immediately_when_event_already_set(capsys):
+    state = {"checked": 0, "incomplete": 0}
+    stop_event = FakeStopEvent([True])
+
+    si._heartbeat(state, stop_event, start_time=100.0)
+
     assert capsys.readouterr().out == ""
 
 
-def test_print_progress_prints_early_when_time_interval_elapsed(capsys, monkeypatch):
-    monkeypatch.setattr(si.time, "monotonic", lambda: 96.0)
-    last_print_time = si._print_progress(150, 3, start_time=90.0, last_print_time=90.0,
-                                          count_interval=100, time_interval=5.0)
-    assert last_print_time == 96.0
-    assert capsys.readouterr().out == "Scanning: 150 files checked so far (3 incomplete, 6s elapsed)\n"
+def test_find_incomplete_starts_and_stops_heartbeat_thread(tmp_path, monkeypatch):
+    (tmp_path / "song.mp3").write_bytes(b"")
+    monkeypatch.setattr(si, "MutagenFile", lambda path: None)
 
+    created_threads = []
 
-def test_print_progress_noop_when_checked_zero(capsys, monkeypatch):
-    monkeypatch.setattr(si.time, "monotonic", lambda: 100.0)
-    last_print_time = si._print_progress(0, 0, start_time=90.0, last_print_time=90.0)
-    assert last_print_time == 90.0
-    assert capsys.readouterr().out == ""
+    class FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            self.daemon = daemon
+            self.started = False
+            self.joined = False
+            created_threads.append(self)
+
+        def start(self):
+            self.started = True
+
+        def join(self):
+            self.joined = True
+
+    monkeypatch.setattr(si.threading, "Thread", FakeThread)
+
+    si.find_incomplete(str(tmp_path))
+
+    assert len(created_threads) == 1
+    thread = created_threads[0]
+    assert thread.daemon is True
+    assert thread.started is True
+    assert thread.joined is True
 
 
 def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):

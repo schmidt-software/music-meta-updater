@@ -7,6 +7,7 @@ detection logic can be unit tested independently of the shell script.
 import sys
 import os
 import time
+import threading
 from mutagen import File as MutagenFile
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
@@ -63,57 +64,63 @@ def _on_walk_error(err):
     print(f"WARN: could not list directory ({err})", file=sys.stderr)
 
 
-def _print_progress(checked, incomplete_count, start_time, last_print_time,
-                     count_interval=100, time_interval=5.0):
-    """Prints a "checked so far" status line every count_interval files or
-    every time_interval seconds, whichever comes first.
+def _heartbeat(state, stop_event, start_time, interval=5.0):
+    """Prints a "checked so far" status line every interval seconds, from a
+    background thread independent of the scanning loop.
 
-    No total/percentage: computing one would need a full pre-pass walk of
-    music_dir, which on network mounts (NFS/SFTP/S3/SMB) can be as slow as
-    the scan itself and would leave the scan silent until it finished. This
-    also always calls print(..., flush=True) instead of relying on the
-    Dockerfile's PYTHONUNBUFFERED=1 to reach the console through
-    update_music_metadata.sh's run_logged/tee pipeline.
+    A single os.walk() step or MutagenFile() open can block for a long time
+    on a slow/flaky network mount (NFS/SFTP/S3/SMB) - the main thread simply
+    isn't running any Python code during that blocking syscall, so nothing
+    printed from inside the loop can ever appear until it returns. Python
+    releases the GIL during blocking I/O though, so this thread keeps
+    ticking regardless and proves the process is still alive (and, if
+    "checked" stops changing between heartbeats, hints that a specific
+    directory listing or file read is the one stuck).
     """
-    now = time.monotonic()
-    if checked and (checked % count_interval == 0 or now - last_print_time >= time_interval):
-        elapsed = now - start_time
-        print(f"Scanning: {checked} files checked so far "
-              f"({incomplete_count} incomplete, {elapsed:.0f}s elapsed)", flush=True)
-        return now
-    return last_print_time
+    while not stop_event.wait(interval):
+        elapsed = time.monotonic() - start_time
+        print(f"Scanning: {state['checked']} files checked so far "
+              f"({state['incomplete']} incomplete, {elapsed:.0f}s elapsed)", flush=True)
 
 
 def find_incomplete(music_dir):
     """Walks music_dir and returns (total_checked, [incomplete_paths])."""
     incomplete = []
     checked = 0
+    state = {"checked": 0, "incomplete": 0}
+    stop_event = threading.Event()
     start_time = time.monotonic()
-    last_print_time = start_time
-    for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
-        last_print_time = _print_progress(checked, len(incomplete), start_time, last_print_time)
-        for fname in files:
-            ext = os.path.splitext(fname)[1].lower()
-            if ext not in AUDIO_EXTS:
-                continue
-            path = os.path.join(root, fname)
-            try:
-                mf = MutagenFile(path)
-            except Exception as e:
-                print(f"WARN: could not read {path} ({e})", file=sys.stderr, flush=True)
-                mf = None
-            else:
-                if mf is None:
-                    print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr, flush=True)
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat, args=(state, stop_event, start_time), daemon=True)
+    heartbeat_thread.start()
+    try:
+        for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in AUDIO_EXTS:
+                    continue
+                path = os.path.join(root, fname)
+                try:
+                    mf = MutagenFile(path)
+                except Exception as e:
+                    print(f"WARN: could not read {path} ({e})", file=sys.stderr, flush=True)
+                    mf = None
+                else:
+                    if mf is None:
+                        print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr, flush=True)
 
-            if mf is not None:
-                missing_cover = not has_cover(mf)
-                missing_tags = not has_basic_tags(mf)
-                if missing_cover or missing_tags:
-                    incomplete.append(path)
+                if mf is not None:
+                    missing_cover = not has_cover(mf)
+                    missing_tags = not has_basic_tags(mf)
+                    if missing_cover or missing_tags:
+                        incomplete.append(path)
 
-            checked += 1
-            last_print_time = _print_progress(checked, len(incomplete), start_time, last_print_time)
+                checked += 1
+                state["checked"] = checked
+                state["incomplete"] = len(incomplete)
+    finally:
+        stop_event.set()
+        heartbeat_thread.join()
     return checked, incomplete
 
 
