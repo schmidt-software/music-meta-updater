@@ -1,5 +1,5 @@
 # Dockerfile for update_music_metadata.sh
-# Contains all dependencies: python3, chromaprint/fpcalc, ffmpeg, beets etc.
+# Contains all dependencies: python3, chromaprint/fpcalc, ffmpeg, beets, supercronic etc.
 
 FROM python:3.11-slim
 
@@ -11,24 +11,41 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # - ffmpeg       -> audio decoding for fingerprinting/mutagen
 # - python3-venv -> venv module (used by the script)
 # - ca-certificates -> for HTTPS access to MusicBrainz/Cover Art Archive
+# - supercronic  -> cron-like scheduler for recurring execution
+# - curl         -> for webhook notifications
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromaprint \
         ffmpeg \
         python3-venv \
         ca-certificates \
+        curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install supercronic (lightweight cron scheduler for containers)
+ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.29/supercronic-linux-amd64 \
+    SUPERCRONIC=supercronic-linux-amd64 \
+    SUPERCRONIC_SHA1=ecb3f9ad06e989e01d25da6f11b85e60cb844e35
+
+RUN curl -fsSLO "$SUPERCRONIC_URL" \
+    && echo "${SUPERCRONIC_SHA1}  ${SUPERCRONIC}" | sha1sum -c - \
+    && chmod +x "$SUPERCRONIC" \
+    && mv "$SUPERCRONIC" /usr/local/bin/supercronic
 
 WORKDIR /app
 
 COPY update_music_metadata.sh /app/update_music_metadata.sh
+COPY entrypoint.sh /app/entrypoint.sh
 COPY scan_incomplete.py /app/scan_incomplete.py
-RUN chmod +x /app/update_music_metadata.sh
+COPY tagging_modes.py /app/tagging_modes.py
+COPY metadata_fallback.py /app/metadata_fallback.py
+RUN chmod +x /app/update_music_metadata.sh /app/entrypoint.sh
 
 # Inside the container, the music folder is mounted at /music,
 # persistent data (beets database, logs) lives under /data.
 ENV MUSIC_DIR=/music \
-    WORK_DIR=/data
+    WORK_DIR=/data \
+    SCHEDULE=""
 
 VOLUME ["/music", "/data"]
 
-ENTRYPOINT ["/app/update_music_metadata.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]

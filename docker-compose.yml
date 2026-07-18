@@ -1,11 +1,20 @@
-# Usage:
+# Usage (one-shot):
 #   MUSIC_HOST_PATH=/path/to/music-storage ACOUSTID_API_KEY=xxxxx docker compose up --build
+#
+# Usage (recurring, daily at 2 AM):
+#   MUSIC_HOST_PATH=/path/to/music-storage ACOUSTID_API_KEY=xxxxx SCHEDULE="0 2 * * *" docker compose up -d
 #
 # MUSIC_HOST_PATH  -> path on the host where the mounted music storage lives
 #                     (e.g. /mnt/music, where a network filesystem like
 #                     s3fs/goofys/rclone/NFS/sshfs is mounted)
 # ACOUSTID_API_KEY -> optional, but recommended for reliable detection
 #                     via audio fingerprinting (free: acoustid.org)
+# SCHEDULE         -> cron expression for recurring runs (optional, default: one-shot)
+#                     Format: "minute hour day month weekday"
+#                     Examples:
+#                       "0 2 * * *"    -> daily at 2 AM
+#                       "0 */6 * * *"  -> every 6 hours
+#                       "0 0 * * 0"    -> weekly on Sunday at midnight
 
 services:
   music-metadata-updater:
@@ -14,12 +23,21 @@ services:
     environment:
       MUSIC_DIR: /music
       ACOUSTID_API_KEY: ${ACOUSTID_API_KEY:-}
+      SCHEDULE: ${SCHEDULE:-}
+      # Optional performance tuning:
+      # SCAN_WORKERS: 4           # default: CPU count + 1, max 8
+      # BATCH_IMPORT_SIZE: 100    # default: 50
+      # TAGGING_MODE: strict      # default, strict, aggressive, cover_only
+      # Optional monitoring:
+      # WEBHOOK_URL: https://your-webhook.example.com/notify
     volumes:
       # Host's mounted music storage is mounted 1:1 into the container.
       - ${MUSIC_HOST_PATH:-/path/to/music}:/music
       # Persistent beets database + logs, so later runs don't
       # re-touch files that are already known.
       - music_metadata_data:/data
+    # For one-shot: restart: "no"
+    # For recurring: restart: "no" (supercronic handles the loop inside)
     restart: "no"
 
 volumes:
