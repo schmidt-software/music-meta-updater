@@ -8,6 +8,7 @@ Supports:
 - Incremental scanning via mtime tracking: only rescans files modified since last run
 - Parallel file checking: uses ThreadPoolExecutor for fast multi-core scanning
 - Resilient error handling: exponential backoff + blacklist for flaky network mounts
+- Incremental cover processing: only re-fetches covers for modified files
 """
 import sys
 import os
@@ -37,6 +38,21 @@ def init_error_db(db_path):
             error_count INTEGER NOT NULL DEFAULT 0,
             last_error_time REAL NOT NULL,
             blacklist_until REAL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def init_cover_db(db_path):
+    """Initialize or open the cover processing tracking database."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cover_tracking (
+            filepath TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            last_cover_processed REAL NOT NULL,
+            cover_status TEXT
         )
     """)
     conn.commit()
@@ -125,6 +141,28 @@ def update_mtime_tracking(conn, filepath, mtime):
     conn.execute(
         "INSERT OR REPLACE INTO file_mtime_tracking (filepath, mtime, last_processed) VALUES (?, ?, ?)",
         (filepath, mtime, now)
+    )
+    conn.commit()
+
+
+def get_cover_mtime(conn, filepath):
+    """Get the stored mtime for a file's cover processing, or None if not tracked."""
+    cursor = conn.execute(
+        "SELECT mtime FROM cover_tracking WHERE filepath = ?",
+        (filepath,)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def update_cover_tracking(conn, filepath, mtime, cover_status=None):
+    """Update or insert the cover processing tracking record."""
+    now = time.time()
+    conn.execute(
+        """INSERT OR REPLACE INTO cover_tracking 
+           (filepath, mtime, last_cover_processed, cover_status)
+           VALUES (?, ?, ?, ?)""",
+        (filepath, mtime, now, cover_status)
     )
     conn.commit()
 
@@ -324,6 +362,59 @@ def find_incomplete(music_dir, mtime_db_path=None, error_db_path=None, num_worke
             print(f"WARN: could not update mtime tracking ({e})", file=sys.stderr)
 
     return total, incomplete, error_telemetry
+
+
+def find_files_needing_cover_update(music_dir, cover_db_path, num_workers=None):
+    """Find files that need cover art updates (mtime changed since last cover processing).
+    
+    Returns [filepath, ...] of files whose cover art should be re-fetched.
+    """
+    if not cover_db_path:
+        # No cover tracking DB, process all files
+        files_to_check = []
+        for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in AUDIO_EXTS:
+                    continue
+                path = os.path.join(root, fname)
+                files_to_check.append(path)
+        return files_to_check
+
+    conn = init_cover_db(cover_db_path)
+    cover_updates = []
+    
+    for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in AUDIO_EXTS:
+                continue
+            path = os.path.join(root, fname)
+            try:
+                current_mtime = os.path.getmtime(path)
+                tracked_cover_mtime = get_cover_mtime(conn, path)
+                # If file hasn't been tracked or mtime changed, update cover
+                if tracked_cover_mtime is None or current_mtime != tracked_cover_mtime:
+                    cover_updates.append(path)
+            except OSError:
+                pass
+    
+    conn.close()
+    return cover_updates
+
+
+def mark_cover_processed(cover_db_path, filepath, cover_status=None):
+    """Mark a file as having been processed for cover art."""
+    if not cover_db_path:
+        return
+    conn = init_cover_db(cover_db_path)
+    try:
+        mtime = os.path.getmtime(filepath)
+        update_cover_tracking(conn, filepath, mtime, cover_status)
+    except OSError:
+        pass
+    finally:
+        conn.close()
 
 
 def main():

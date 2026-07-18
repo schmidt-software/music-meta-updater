@@ -473,3 +473,108 @@ def test_find_incomplete_parallel_with_incremental(tmp_path, monkeypatch):
         assert str(file1) not in incomplete
     finally:
         os.unlink(db_path)
+
+
+# ----------------------- Cover tracking & incremental fetching ----------
+
+
+def test_init_cover_db():
+    """Cover tracking database is created with correct schema."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_cover_db(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cover_tracking'"
+        )
+        assert cursor.fetchone() is not None
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_cover_tracking_get_and_update():
+    """Cover mtime can be stored and retrieved."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_cover_db(db_path)
+        filepath = "/path/to/file.mp3"
+        mtime = 1234567890.5
+
+        # Initially not tracked
+        assert si.get_cover_mtime(conn, filepath) is None
+
+        # Update and retrieve
+        si.update_cover_tracking(conn, filepath, mtime, cover_status="success")
+        assert si.get_cover_mtime(conn, filepath) == mtime
+
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_find_files_needing_cover_update(tmp_path):
+    """Identifies files that need cover re-fetching due to mtime change."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+
+    try:
+        file1 = tmp_path / "processed.mp3"
+        file1.write_bytes(b"")
+        file2 = tmp_path / "new.mp3"
+        file2.write_bytes(b"")
+        file3 = tmp_path / "modified.mp3"
+        file3.write_bytes(b"old")
+
+        # Pre-populate DB with file1 and file3 (with old mtime)
+        conn = si.init_cover_db(db_path)
+        mtime1 = os.path.getmtime(str(file1))
+        si.update_cover_tracking(conn, str(file1), mtime1, "success")
+        
+        # file3: store old mtime
+        old_mtime = mtime1 - 100
+        si.update_cover_tracking(conn, str(file3), old_mtime, "success")
+        conn.close()
+
+        # Modify file3 to change mtime
+        import time
+        time.sleep(0.01)
+        file3.write_bytes(b"new")
+
+        # Find files needing update
+        files_needing_update = si.find_files_needing_cover_update(str(tmp_path), db_path)
+
+        # file1: processed and unchanged -> should NOT be in list
+        # file2: never seen -> should be in list
+        # file3: modified -> should be in list
+        assert str(file1) not in files_needing_update
+        assert str(file2) in files_needing_update
+        assert str(file3) in files_needing_update
+    finally:
+        if os.path.exists(db_path):
+            os.unlink(db_path)
+
+
+def test_mark_cover_processed():
+    """Cover processing status can be marked for a file."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+            filepath = f.name
+
+        # Mark as processed
+        si.mark_cover_processed(db_path, filepath, "success")
+
+        # Verify it was tracked
+        conn = si.init_cover_db(db_path)
+        mtime_tracked = si.get_cover_mtime(conn, filepath)
+        assert mtime_tracked is not None
+        conn.close()
+        
+        os.unlink(filepath)
+    finally:
+        if os.path.exists(db_path):
+            os.unlink(db_path)
