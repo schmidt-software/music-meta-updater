@@ -23,14 +23,17 @@ only be guessed from the filename, which is much less reliable.
   Python/mutagen for missing tags (title/artist/album) or missing
   cover art, and only lets `beets` automatically tag/cover those files.
   Leaves already-complete files untouched and doesn't move/rename
-  anything (existing folder structure is preserved).
+  anything (existing folder structure is preserved). Uses incremental scanning
+  (tracks file modification times to skip unmodified files on subsequent runs).
 - `Dockerfile` – Image with all dependencies (python3, chromaprint/fpcalc,
   ffmpeg, beets, mutagen, pyacoustid).
 - `docker-compose.yml` – Mounts the music folder to `/music` plus a
-  persistent volume `/data` for the beets database and logs.
+  persistent volume `/data` for the beets database, mtime tracking DB, and logs.
 - `.env.example` – Template for the host path and AcoustID key.
 - `scan_incomplete.py` – Detection logic (missing cover/tags) used by
   `update_music_metadata.sh`, kept in its own module so it's unit testable.
+  Supports incremental mode via mtime tracking (optional third argument for
+  mtime database path).
 - `tests/` – Unit tests for `scan_incomplete.py`.
 
 ## Supported mount types
@@ -105,16 +108,32 @@ container) for later inspection.
 ## Tests
 
 Unit tests cover the detection logic in `scan_incomplete.py` (missing
-cover art / missing tags / directory scan) with mocked mutagen objects,
-so they run without needing real audio files.
+cover art / missing tags / directory scan / incremental mtime tracking)
+with mocked mutagen objects and temporary SQLite databases, so they run
+without needing real audio files.
 
 ```bash
 pip install -r requirements-dev.txt
 pytest tests/
 ```
 
+## Incremental Scanning
+
+Starting with this version, `scan_incomplete.py` tracks file modification times
+(mtime) in a SQLite database (`mtime_tracking.db` in `$WORK_DIR`). This means:
+
+- **First run:** Scans all audio files in the library (may take a while)
+- **Subsequent runs:** Only scans files that have been modified since the last run
+- **Much faster on stable libraries:** If your library hasn't changed, subsequent
+  runs complete in seconds instead of minutes/hours
+
+The mtime database is stored in the `/data` persistent volume (Docker) or
+`$WORK_DIR` (direct invocation), so tracking persists across runs.
+
 ## Open items / possible next steps
 
+- Parallel file scanning (multi-threaded or multi-process) for even faster
+  initial scans on large libraries
 - Recurring execution (cron in the container, or external scheduling)
 - Finer control over matching thresholds in the beets config
   (`match.strong_rec_thresh` etc.), in case mismatches occur

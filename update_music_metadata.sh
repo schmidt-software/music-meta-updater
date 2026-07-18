@@ -40,6 +40,7 @@ WORK_DIR="${WORK_DIR:-$HOME/.music-metadata-tool}"
 VENV_DIR="$WORK_DIR/venv"
 BEETS_CONFIG="$WORK_DIR/beets_config.yaml"
 BEETS_LIBRARY="$WORK_DIR/library.db"
+MTIME_DB="$WORK_DIR/mtime_tracking.db"
 LOG_FILE="$WORK_DIR/update.log"
 INCOMPLETE_LIST="$WORK_DIR/incomplete_files.lst"
 
@@ -169,9 +170,9 @@ fi
 
 # ----------------------------- Find files with missing data -----------------
 
-log "Scanning $MUSIC_DIR for files without cover art or metadata..."
+log "Scanning $MUSIC_DIR for files without cover art or metadata (incremental mode)..."
 
-run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST"
+run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST" "$MTIME_DB"
 
 INCOMPLETE_COUNT=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
 

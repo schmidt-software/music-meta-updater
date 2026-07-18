@@ -1,5 +1,6 @@
 import sys
 import os
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -168,3 +169,126 @@ def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch,
     assert "could not list directory" in captured.err
     assert total == 0
     assert incomplete == []
+
+
+# ----------------------- Incremental mtime tracking ----------------------
+
+
+def test_init_mtime_db():
+    """Database is created with the correct schema."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_mtime_db(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_mtime_tracking'"
+        )
+        assert cursor.fetchone() is not None
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_mtime_tracking_get_and_update():
+    """Mtime can be stored and retrieved."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_mtime_db(db_path)
+        filepath = "/path/to/file.mp3"
+        mtime = 1234567890.5
+
+        # Initially not tracked
+        assert si.get_tracked_mtime(conn, filepath) is None
+
+        # Update and retrieve
+        si.update_mtime_tracking(conn, filepath, mtime)
+        assert si.get_tracked_mtime(conn, filepath) == mtime
+
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_find_incomplete_incremental_mode_skips_unchanged(tmp_path, monkeypatch):
+    """In incremental mode, files with unchanged mtime are skipped."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+
+    try:
+        unchanged = tmp_path / "unchanged.mp3"
+        unchanged.write_bytes(b"")
+        changed = tmp_path / "changed.mp3"
+        changed.write_bytes(b"")
+
+        # Pre-populate DB with unchanged file
+        conn = si.init_mtime_db(db_path)
+        unchanged_mtime = os.path.getmtime(str(unchanged))
+        si.update_mtime_tracking(conn, str(unchanged), unchanged_mtime)
+        conn.close()
+
+        unchanged_mf = FakeMF(tags=FakeTags())  # incomplete (missing tags)
+        changed_mf = FakeMF(tags=FakeTags())    # incomplete
+
+        call_count = {"unchanged": 0, "changed": 0}
+
+        def fake_mutagen_file(path):
+            if str(unchanged) in path:
+                call_count["unchanged"] += 1
+                return unchanged_mf
+            elif str(changed) in path:
+                call_count["changed"] += 1
+                return changed_mf
+            return None
+
+        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
+
+        # First incremental scan: unchanged file should be skipped
+        total, incomplete = si.find_incomplete(str(tmp_path), db_path)
+
+        # unchanged file's MutagenFile should NOT have been called
+        # (it's been skipped due to matching mtime)
+        assert call_count["unchanged"] == 0
+        # changed file WAS scanned
+        assert call_count["changed"] == 1
+        assert str(changed) in incomplete
+        assert str(unchanged) not in incomplete
+    finally:
+        os.unlink(db_path)
+
+
+def test_find_incomplete_incremental_detects_file_changes(tmp_path, monkeypatch):
+    """When a file is modified, incremental scan detects it."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+
+    try:
+        file_to_modify = tmp_path / "track.mp3"
+        file_to_modify.write_bytes(b"old content")
+
+        # First scan: record current mtime
+        conn = si.init_mtime_db(db_path)
+        initial_mtime = os.path.getmtime(str(file_to_modify))
+        si.update_mtime_tracking(conn, str(file_to_modify), initial_mtime)
+        conn.close()
+
+        # Modify the file (change content + mtime)
+        import time
+        time.sleep(0.01)  # ensure mtime differs
+        file_to_modify.write_bytes(b"new content")
+
+        scan_count = {"count": 0}
+
+        def fake_mutagen_file(path):
+            scan_count["count"] += 1
+            return FakeMF(tags=FakeTags())  # incomplete
+
+        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
+
+        # Second scan: file should be rescanned because mtime changed
+        total, incomplete = si.find_incomplete(str(tmp_path), db_path)
+
+        assert scan_count["count"] > 0  # file WAS scanned
+        assert str(file_to_modify) in incomplete
+    finally:
+        os.unlink(db_path)
