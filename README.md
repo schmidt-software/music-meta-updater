@@ -169,6 +169,54 @@ environment:
 **Combined impact:** Typical speedup of **3-5x on large libraries** (1000+ files)
 compared to single-threaded, single-file processing.
 
+## Monitoring & Integration
+
+### Exit Codes
+
+The script returns meaningful exit codes for automation/orchestration:
+
+- **0** = Success: All files processed, no errors
+- **1** = Critical error: Music folder not found, Python not installed, etc.
+- **2** = Partial success: Some files processed, but warnings/errors occurred
+
+### Health Check Output (JSON)
+
+After each run, metrics are written to `$WORK_DIR/metrics.json`:
+
+```json
+{
+  "timestamp": "2024-07-18T21:54:00Z",
+  "status": "success",
+  "exit_code": 0,
+  "music_dir": "/music",
+  "total_files_scanned": 1247,
+  "incomplete_files_found": 45,
+  "files_processed": 45,
+  "tags_updated": 45,
+  "errors": 0,
+  "warnings": [],
+  "duration_seconds": 23.45,
+  "log_file": "/data/update.log"
+}
+```
+
+### Webhook Notifications
+
+Optionally send health check metrics to a webhook URL on completion:
+
+```bash
+WEBHOOK_URL=https://your-monitoring.example.com/webhook MUSIC_DIR=/music ./update_music_metadata.sh
+```
+
+Or in `docker-compose.yml`:
+```yaml
+environment:
+  WEBHOOK_URL: "https://your-monitoring.example.com/webhook"
+```
+
+The JSON metrics are POSTed to the URL with `Content-Type: application/json`.
+Useful for Kubernetes Events, Alerting Systems, or Custom Dashboards.
+
 ## Open items / possible next steps
 
 - Recurring execution (cron in the container, or external scheduling)

@@ -9,6 +9,11 @@
 #
 # Runs completely non-interactively (no prompts, no confirmations).
 #
+# Exit codes:
+#   0 = success (all files processed, no critical errors)
+#   1 = critical error (music folder not found, python not available, etc.)
+#   2 = partial success (some files processed, but errors occurred or no files needed updating)
+#
 # Requires:
 #   - python3 + pip
 #   - beets (https://beets.io) incl. plugins: fetchart, embedart, chroma
@@ -24,6 +29,7 @@
 # Environment variables (optional):
 #   BATCH_IMPORT_SIZE  -> files per beet import call (default: 50)
 #   SCAN_WORKERS       -> parallel file checking threads (default: CPU count + 1, max 8)
+#   WEBHOOK_URL        -> POST JSON health check to this URL on completion
 #
 # ---------------------------------------------------------------------------
 
@@ -45,6 +51,9 @@ SCAN_WORKERS="${SCAN_WORKERS:-}"
 # Batch import: files per beet import call
 BATCH_IMPORT_SIZE="${BATCH_IMPORT_SIZE:-50}"
 
+# Optional webhook for health check notifications
+WEBHOOK_URL="${WEBHOOK_URL:-}"
+
 # Working directory for venv, beets config and logs.
 WORK_DIR="${WORK_DIR:-$HOME/.music-metadata-tool}"
 VENV_DIR="$WORK_DIR/venv"
@@ -53,8 +62,20 @@ BEETS_LIBRARY="$WORK_DIR/library.db"
 MTIME_DB="$WORK_DIR/mtime_tracking.db"
 LOG_FILE="$WORK_DIR/update.log"
 INCOMPLETE_LIST="$WORK_DIR/incomplete_files.lst"
+BEETS_IMPORT_LOG="$WORK_DIR/beets_import.log"
+METRICS_FILE="$WORK_DIR/metrics.json"
 
 mkdir -p "$WORK_DIR"
+
+# ----------------------------- Metrics tracking ----------------------------
+
+START_TIME=$(date +%s%N)
+TOTAL_FILES=0
+INCOMPLETE_FILES=0
+PROCESSED_FILES=0
+TAGGED_FILES=0
+ERROR_COUNT=0
+WARNING_MESSAGES=()
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -64,6 +85,8 @@ log() {
 # stdout, in addition to LOG_FILE.
 err() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2
+  ((ERROR_COUNT++))
+  WARNING_MESSAGES+=("$*")
 }
 
 # Runs "$@", streaming its stdout/stderr live to the console (debug output
@@ -75,10 +98,65 @@ run_logged() {
     2> >(tee -a "$LOG_FILE" >&2)
 }
 
+# Generate JSON health check output
+emit_metrics() {
+  local exit_code=$1
+  local end_time=$(date +%s%N)
+  local duration_ms=$(( (end_time - START_TIME) / 1000000 ))
+  local duration_sec=$(echo "scale=2; $duration_ms / 1000" | bc)
+  local status_str="success"
+  
+  if [ $exit_code -eq 1 ]; then
+    status_str="error"
+  elif [ $exit_code -eq 2 ]; then
+    status_str="partial_success"
+  fi
+
+  # Build warnings JSON array
+  local warnings_json="[]"
+  if [ ${#WARNING_MESSAGES[@]} -gt 0 ]; then
+    warnings_json=$(printf '%s\n' "${WARNING_MESSAGES[@]}" | jq -R . | jq -s . || echo "[]")
+  fi
+
+  cat > "$METRICS_FILE" <<EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "status": "$status_str",
+  "exit_code": $exit_code,
+  "music_dir": "$MUSIC_DIR",
+  "total_files_scanned": $TOTAL_FILES,
+  "incomplete_files_found": $INCOMPLETE_FILES,
+  "files_processed": $PROCESSED_FILES,
+  "tags_updated": $TAGGED_FILES,
+  "errors": $ERROR_COUNT,
+  "warnings": $warnings_json,
+  "duration_seconds": $duration_sec,
+  "log_file": "$LOG_FILE"
+}
+EOF
+
+  log "Metrics written to: $METRICS_FILE"
+  cat "$METRICS_FILE"
+
+  # Send to webhook if configured
+  if [ -n "$WEBHOOK_URL" ]; then
+    log "Sending metrics to webhook: $WEBHOOK_URL"
+    if command -v curl >/dev/null 2>&1; then
+      curl -s -X POST "$WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -d @"$METRICS_FILE" \
+        || err "WARNING: Failed to send webhook notification"
+    else
+      err "WARNING: curl not available, cannot send webhook notification"
+    fi
+  fi
+}
+
 # ----------------------------- Pre-checks -----------------------------------
 
 if [ ! -d "$MUSIC_DIR" ]; then
   err "ERROR: Music folder '$MUSIC_DIR' does not exist or is not mounted."
+  emit_metrics 1
   exit 1
 fi
 
@@ -88,6 +166,7 @@ log "Starting metadata/cover update for: $MUSIC_DIR"
 
 if ! command -v python3 >/dev/null 2>&1; then
   err "ERROR: python3 is required but not installed."
+  emit_metrics 1
   exit 1
 fi
 
@@ -146,7 +225,7 @@ import:
   quiet: yes
   quiet_fallback: asis
   resume: no
-  log: $WORK_DIR/beets_import.log
+  log: $BEETS_IMPORT_LOG
 
 match:
   preferred:
@@ -190,15 +269,22 @@ fi
 
 run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}"
 
-INCOMPLETE_COUNT=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
+# Parse scan output for metrics (run again to capture the final line)
+SCAN_OUTPUT=$(python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}" 2>&1 | grep "audio files checked" | tail -1)
+if [[ $SCAN_OUTPUT =~ ([0-9]+)\ audio\ files\ checked,\ ([0-9]+)\ incomplete ]]; then
+  TOTAL_FILES="${BASH_REMATCH[1]}"
+  INCOMPLETE_FILES="${BASH_REMATCH[2]}"
+  log "Scan complete: $TOTAL_FILES files checked, $INCOMPLETE_FILES incomplete"
+fi
 
-if [ "$INCOMPLETE_COUNT" -eq 0 ]; then
+if [ "$INCOMPLETE_FILES" -eq 0 ]; then
   log "All files already have cover art and metadata. Nothing to do."
   deactivate
+  emit_metrics 0
   exit 0
 fi
 
-log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic tagging (batch mode)..."
+log "$INCOMPLETE_FILES file(s) without cover/metadata found. Starting automatic tagging (batch mode)..."
 
 # ----------------------------- Tagging via beets (batch mode) ----------------
 #
@@ -217,6 +303,7 @@ while IFS= read -r file; do
     log "Processing batch of ${#BATCH_FILES[@]} files..."
     run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}" \
       || err "WARNING: Some files in batch could not be automatically tagged (no confident match)."
+    PROCESSED_FILES=$((PROCESSED_FILES + ${#BATCH_FILES[@]}))
     BATCH_FILES=()
   fi
 done < "$INCOMPLETE_LIST"
@@ -226,7 +313,10 @@ if [ ${#BATCH_FILES[@]} -gt 0 ]; then
   log "Processing final batch of ${#BATCH_FILES[@]} files..."
   run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}" \
     || err "WARNING: Some files in final batch could not be automatically tagged (no confident match)."
+  PROCESSED_FILES=$((PROCESSED_FILES + ${#BATCH_FILES[@]}))
 fi
+
+TAGGED_FILES=$PROCESSED_FILES
 
 # ----------------------------- Fetch cover art -------------------------------
 # fetchart/embedart run with "force: no" -> only albums/files without an
@@ -238,4 +328,14 @@ run_logged beet -c "$BEETS_CONFIG" embedart -q || true
 
 deactivate
 
-log "Done. Details in the log: $WORK_DIR/beets_import.log"
+log "Done. Details in the log: $BEETS_IMPORT_LOG"
+
+# ----------------------------- Emit metrics and exit -------------------------
+
+EXIT_CODE=0
+if [ $ERROR_COUNT -gt 0 ]; then
+  EXIT_CODE=2  # Partial success (some warnings/errors occurred)
+fi
+
+emit_metrics $EXIT_CODE
+exit $EXIT_CODE
