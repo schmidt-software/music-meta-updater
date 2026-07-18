@@ -106,7 +106,7 @@ def test_has_basic_tags_no_tags():
     assert si.has_basic_tags(mf) is False
 
 
-# --------------------------- find_incomplete -----------------------------
+# --------------------------- find_incomplete (returns 3-tuple now) --------
 
 
 def test_find_incomplete(tmp_path, monkeypatch):
@@ -143,13 +143,14 @@ def test_find_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
-    total, incomplete = si.find_incomplete(str(tmp_path))
+    total, incomplete, errors = si.find_incomplete(str(tmp_path))
 
     assert total == 4  # all *.mp3/*.flac files, txt excluded
     assert str(complete) not in incomplete
     assert str(missing_cover) in incomplete
     assert str(missing_tags) in incomplete
     assert str(corrupt) not in incomplete
+    assert isinstance(errors, dict)
 
 
 def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
@@ -163,12 +164,105 @@ def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch,
 
     monkeypatch.setattr(si.os, "walk", fake_walk)
 
-    total, incomplete = si.find_incomplete(str(tmp_path))
+    total, incomplete, errors = si.find_incomplete(str(tmp_path))
 
     captured = capsys.readouterr()
     assert "could not list directory" in captured.err
     assert total == 0
     assert incomplete == []
+
+
+# ----------------------- Error tracking & resilience --------------------
+
+
+def test_init_error_db():
+    """Error tracking database is created with correct schema."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_error_db(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='error_tracking'"
+        )
+        assert cursor.fetchone() is not None
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_record_and_check_error():
+    """Errors can be recorded and files can be blacklisted."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_error_db(db_path)
+        filepath = "/path/to/flaky_file.mp3"
+        
+        # Record an error
+        si.record_error(conn, filepath, "io_error", "Connection timeout", blacklist_duration=1)
+        
+        # File should be blacklisted
+        assert si.is_blacklisted(conn, filepath) is True
+        
+        # Wait for blacklist to expire
+        import time
+        time.sleep(1.1)
+        
+        # File should no longer be blacklisted
+        assert si.is_blacklisted(conn, filepath) is False
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_get_error_type():
+    """Error classification works correctly."""
+    assert si.get_error_type(PermissionError("denied")) == "permission_error"
+    assert si.get_error_type(FileNotFoundError("missing")) == "file_not_found"
+    assert si.get_error_type(OSError("io error")) == "io_error"
+    # TimeoutError is subclass of OSError, so it's classified as io_error
+    assert si.get_error_type(TimeoutError("timeout")) == "io_error"
+    assert si.get_error_type(ValueError("other")) == "unknown_error"
+
+
+def test_error_telemetry_collection():
+    """Error telemetry is collected correctly."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mtime.db") as f:
+        mtime_db = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".error.db") as f:
+        error_db = f.name
+    
+    try:
+        # Create a tmp_path with audio files
+        import tempfile as tmplib
+        with tmplib.TemporaryDirectory() as tmp_dir:
+            file1 = os.path.join(tmp_dir, "track.mp3")
+            open(file1, "w").close()
+            
+            # Mock MutagenFile to raise errors
+            original_check_file = si._check_file_with_retry
+            call_count = [0]
+            
+            def mock_check_file(path, mtime_db_path=None, error_db_path=None):
+                call_count[0] += 1
+                # Simulate I/O error
+                if call_count[0] <= si.MAX_RETRIES:
+                    raise OSError("Simulated I/O error")
+                # After retries, record error
+                return (path, False, True, ("io_error", "Simulated I/O error"))
+            
+            si._check_file_with_retry = mock_check_file
+            try:
+                total, incomplete, errors = si.find_incomplete(tmp_dir, mtime_db, error_db, num_workers=1)
+                # Should have captured io_error
+                assert "io_error" in errors or len(errors) > 0
+            finally:
+                si._check_file_with_retry = original_check_file
+    finally:
+        if os.path.exists(mtime_db):
+            os.unlink(mtime_db)
+        if os.path.exists(error_db):
+            os.unlink(error_db)
 
 
 # ----------------------- Incremental mtime tracking ----------------------
@@ -244,7 +338,7 @@ def test_find_incomplete_incremental_mode_skips_unchanged(tmp_path, monkeypatch)
         monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
         # First incremental scan: unchanged file should be skipped
-        total, incomplete = si.find_incomplete(str(tmp_path), db_path)
+        total, incomplete, _ = si.find_incomplete(str(tmp_path), db_path)
 
         # unchanged file's MutagenFile should NOT have been called
         # (it's been skipped due to matching mtime)
@@ -286,7 +380,7 @@ def test_find_incomplete_incremental_detects_file_changes(tmp_path, monkeypatch)
         monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
         # Second scan: file should be rescanned because mtime changed
-        total, incomplete = si.find_incomplete(str(tmp_path), db_path)
+        total, incomplete, _ = si.find_incomplete(str(tmp_path), db_path)
 
         assert scan_count["count"] > 0  # file WAS scanned
         assert str(file_to_modify) in incomplete
@@ -325,10 +419,10 @@ def test_find_incomplete_with_parallel_workers(tmp_path, monkeypatch):
     monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
     # Single-threaded scan
-    _, incomplete_single = si.find_incomplete(str(tmp_path), None, num_workers=1)
+    _, incomplete_single, _ = si.find_incomplete(str(tmp_path), None, None, num_workers=1)
 
     # Multi-threaded scan
-    _, incomplete_multi = si.find_incomplete(str(tmp_path), None, num_workers=4)
+    _, incomplete_multi, _ = si.find_incomplete(str(tmp_path), None, None, num_workers=4)
 
     # Results should be identical
     assert set(incomplete_single) == set(incomplete_multi)
@@ -369,7 +463,7 @@ def test_find_incomplete_parallel_with_incremental(tmp_path, monkeypatch):
         monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
         # Parallel + incremental scan
-        _, incomplete = si.find_incomplete(str(tmp_path), db_path, num_workers=2)
+        _, incomplete, _ = si.find_incomplete(str(tmp_path), db_path, None, num_workers=2)
 
         # file1 should be skipped (unchanged mtime)
         # file2 should be scanned
