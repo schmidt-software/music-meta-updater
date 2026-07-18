@@ -292,3 +292,90 @@ def test_find_incomplete_incremental_detects_file_changes(tmp_path, monkeypatch)
         assert str(file_to_modify) in incomplete
     finally:
         os.unlink(db_path)
+
+
+# ----------------------- Parallel file checking -----------------------
+
+
+def test_find_incomplete_with_parallel_workers(tmp_path, monkeypatch):
+    """Parallel scan with multiple workers produces same results as single-threaded."""
+    file1 = tmp_path / "track1.mp3"
+    file1.write_bytes(b"")
+    file2 = tmp_path / "track2.mp3"
+    file2.write_bytes(b"")
+    file3 = tmp_path / "track3.mp3"
+    file3.write_bytes(b"")
+
+    # Mock mutagen: file1 complete, file2/file3 incomplete
+    complete_mf = FakeMF(tags=FakeTags({
+        "APIC:cover": b"...",
+        "title": ["T"], "artist": ["A"], "album": ["Al"],
+    }))
+    incomplete_mf = FakeMF(tags=FakeTags())
+
+    by_name = {
+        str(file1): complete_mf,
+        str(file2): incomplete_mf,
+        str(file3): incomplete_mf,
+    }
+
+    def fake_mutagen_file(path):
+        return by_name.get(path)
+
+    monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
+
+    # Single-threaded scan
+    _, incomplete_single = si.find_incomplete(str(tmp_path), None, num_workers=1)
+
+    # Multi-threaded scan
+    _, incomplete_multi = si.find_incomplete(str(tmp_path), None, num_workers=4)
+
+    # Results should be identical
+    assert set(incomplete_single) == set(incomplete_multi)
+    assert len(incomplete_multi) == 2
+    assert str(file1) not in incomplete_multi
+    assert str(file2) in incomplete_multi
+    assert str(file3) in incomplete_multi
+
+
+def test_find_incomplete_parallel_with_incremental(tmp_path, monkeypatch):
+    """Parallel + incremental mode work together."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+
+    try:
+        file1 = tmp_path / "track1.mp3"
+        file1.write_bytes(b"")
+        file2 = tmp_path / "track2.mp3"
+        file2.write_bytes(b"")
+
+        # Pre-populate DB with file1 (unchanged)
+        conn = si.init_mtime_db(db_path)
+        mtime1 = os.path.getmtime(str(file1))
+        si.update_mtime_tracking(conn, str(file1), mtime1)
+        conn.close()
+
+        incomplete_mf = FakeMF(tags=FakeTags())
+
+        call_count = {"file1": 0, "file2": 0}
+
+        def fake_mutagen_file(path):
+            if str(file1) in path:
+                call_count["file1"] += 1
+            elif str(file2) in path:
+                call_count["file2"] += 1
+            return incomplete_mf
+
+        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
+
+        # Parallel + incremental scan
+        _, incomplete = si.find_incomplete(str(tmp_path), db_path, num_workers=2)
+
+        # file1 should be skipped (unchanged mtime)
+        # file2 should be scanned
+        assert call_count["file1"] == 0  # skipped
+        assert call_count["file2"] == 1  # scanned
+        assert str(file2) in incomplete
+        assert str(file1) not in incomplete
+    finally:
+        os.unlink(db_path)

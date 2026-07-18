@@ -4,16 +4,20 @@
 Used by update_music_metadata.sh; kept as a standalone module so the
 detection logic can be unit tested independently of the shell script.
 
-Supports incremental scanning via mtime tracking: only rescans files that
-have been modified since last scan.
+Supports:
+- Incremental scanning via mtime tracking: only rescans files modified since last run
+- Parallel file checking: uses ThreadPoolExecutor for fast multi-core scanning
 """
 import sys
 import os
 import sqlite3
 import time
 from mutagen import File as MutagenFile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
+# Default worker threads for parallel file checking (can be overridden)
+DEFAULT_WORKERS = min(8, (os.cpu_count() or 1) + 1)
 
 
 def init_mtime_db(db_path):
@@ -101,61 +105,104 @@ def _on_walk_error(err):
     print(f"WARN: could not list directory ({err})", file=sys.stderr)
 
 
-def find_incomplete(music_dir, mtime_db_path=None):
+def _check_file(path, mtime_db_path=None):
+    """Check a single file for completeness. Returns (path, is_incomplete, should_track_mtime)
+    
+    Should be called in a worker thread. Opens its own DB connection if
+    mtime_db_path is provided (sqlite3 connections are NOT thread-safe).
+    """
+    # Incremental check: skip if mtime hasn't changed
+    if mtime_db_path:
+        try:
+            current_mtime = os.path.getmtime(path)
+            conn = init_mtime_db(mtime_db_path)
+            tracked_mtime = get_tracked_mtime(conn, path)
+            conn.close()
+            if tracked_mtime is not None and current_mtime == tracked_mtime:
+                # File hasn't changed; skip it
+                return (path, False, False)  # not incomplete, don't track
+        except OSError as e:
+            print(f"WARN: could not stat {path} ({e})", file=sys.stderr)
+            return (path, False, False)
+
+    # Try to read and check the file
+    try:
+        mf = MutagenFile(path)
+    except Exception as e:
+        print(f"WARN: could not read {path} ({e})", file=sys.stderr)
+        return (path, False, True)  # skip but still update mtime tracking
+
+    if mf is None:
+        print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
+        return (path, False, True)
+
+    missing_cover = not has_cover(mf)
+    missing_tags = not has_basic_tags(mf)
+    is_incomplete = missing_cover or missing_tags
+
+    return (path, is_incomplete, True)
+
+
+def find_incomplete(music_dir, mtime_db_path=None, num_workers=None):
     """Walks music_dir and returns (total_checked, [incomplete_paths]).
     
     If mtime_db_path is provided, only scans files that have been modified
     since last processing (incremental mode). Files are tracked in a SQLite DB.
+    
+    Uses parallel file checking with ThreadPoolExecutor (num_workers threads).
+    If num_workers is None, defaults to CPU count + 1, capped at 8.
     """
-    conn = None
-    if mtime_db_path:
-        conn = init_mtime_db(mtime_db_path)
+    if num_workers is None:
+        num_workers = DEFAULT_WORKERS
 
-    incomplete = []
-    total = 0
+    # First pass: collect all audio files to check
+    files_to_check = []
     for root, _dirs, files in os.walk(music_dir, onerror=_on_walk_error):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in AUDIO_EXTS:
                 continue
-            total += 1
             path = os.path.join(root, fname)
+            files_to_check.append(path)
 
-            # If incremental mode: skip files that haven't been modified
-            if conn:
-                try:
-                    current_mtime = os.path.getmtime(path)
-                    tracked_mtime = get_tracked_mtime(conn, path)
-                    if tracked_mtime is not None and current_mtime == tracked_mtime:
-                        # File hasn't changed since last scan; skip it
-                        continue
-                except OSError as e:
-                    print(f"WARN: could not stat {path} ({e})", file=sys.stderr)
-                    continue
+    total = len(files_to_check)
+    incomplete = []
 
+    # Second pass: check files in parallel
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(_check_file, path, mtime_db_path): path
+            for path in files_to_check
+        }
+
+        # Batch update mtime tracking (once per batch to avoid thread contention)
+        mtime_updates = {}
+
+        for future in as_completed(futures):
             try:
-                mf = MutagenFile(path)
+                path, is_incomplete, should_track = future.result()
+                if is_incomplete:
+                    incomplete.append(path)
+
+                # Queue mtime update (batch later)
+                if should_track and mtime_db_path:
+                    try:
+                        mtime = os.path.getmtime(path)
+                        mtime_updates[path] = mtime
+                    except OSError:
+                        pass
             except Exception as e:
-                print(f"WARN: could not read {path} ({e})", file=sys.stderr)
-                continue
-            if mf is None:
-                print(f"WARN: unknown/corrupt format: {path}", file=sys.stderr)
-                continue
-            missing_cover = not has_cover(mf)
-            missing_tags = not has_basic_tags(mf)
-            if missing_cover or missing_tags:
-                incomplete.append(path)
+                print(f"WARN: unexpected error checking file ({e})", file=sys.stderr)
 
-            # Update mtime tracking after checking the file
-            if conn:
-                try:
-                    mtime = os.path.getmtime(path)
-                    update_mtime_tracking(conn, path, mtime)
-                except OSError:
-                    pass
-
-    if conn:
-        conn.close()
+    # Batch write mtime tracking (after all workers finish)
+    if mtime_updates and mtime_db_path:
+        try:
+            conn = init_mtime_db(mtime_db_path)
+            for path, mtime in mtime_updates.items():
+                update_mtime_tracking(conn, path, mtime)
+            conn.close()
+        except Exception as e:
+            print(f"WARN: could not update mtime tracking ({e})", file=sys.stderr)
 
     return total, incomplete
 
@@ -165,8 +212,15 @@ def main():
     out_file = sys.argv[2]
     # Optional third argument: path to mtime tracking database
     mtime_db = sys.argv[3] if len(sys.argv) > 3 else None
+    # Optional fourth argument: number of worker threads
+    num_workers = None
+    if len(sys.argv) > 4:
+        try:
+            num_workers = int(sys.argv[4])
+        except ValueError:
+            pass
 
-    total, incomplete = find_incomplete(music_dir, mtime_db)
+    total, incomplete = find_incomplete(music_dir, mtime_db, num_workers)
     with open(out_file, "w") as f:
         for p in incomplete:
             f.write(p + "\n")

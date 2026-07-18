@@ -21,6 +21,10 @@
 # Usage:
 #   MUSIC_DIR=/path/to/music ACOUSTID_API_KEY=xxxxx ./update_music_metadata.sh
 #
+# Environment variables (optional):
+#   BATCH_IMPORT_SIZE  -> files per beet import call (default: 50)
+#   SCAN_WORKERS       -> parallel file checking threads (default: CPU count + 1, max 8)
+#
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -34,6 +38,12 @@ MUSIC_DIR="${MUSIC_DIR:-/path/to/music}"
 
 # Optional AcoustID API key for audio fingerprinting (recommended).
 ACOUSTID_API_KEY="${ACOUSTID_API_KEY:-}"
+
+# Parallel scanning: number of worker threads (optional, auto-detected if not set)
+SCAN_WORKERS="${SCAN_WORKERS:-}"
+
+# Batch import: files per beet import call
+BATCH_IMPORT_SIZE="${BATCH_IMPORT_SIZE:-50}"
 
 # Working directory for venv, beets config and logs.
 WORK_DIR="${WORK_DIR:-$HOME/.music-metadata-tool}"
@@ -170,9 +180,15 @@ fi
 
 # ----------------------------- Find files with missing data -----------------
 
-log "Scanning $MUSIC_DIR for files without cover art or metadata (incremental mode)..."
+log "Scanning $MUSIC_DIR for files without cover art or metadata (parallel mode)..."
 
-run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST" "$MTIME_DB"
+# Build scan_incomplete.py arguments
+SCAN_ARGS=("$MUSIC_DIR" "$INCOMPLETE_LIST" "$MTIME_DB")
+if [ -n "$SCAN_WORKERS" ]; then
+  SCAN_ARGS+=("$SCAN_WORKERS")
+fi
+
+run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}"
 
 INCOMPLETE_COUNT=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
 
@@ -182,20 +198,35 @@ if [ "$INCOMPLETE_COUNT" -eq 0 ]; then
   exit 0
 fi
 
-log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic tagging..."
+log "$INCOMPLETE_COUNT file(s) without cover/metadata found. Starting automatic tagging (batch mode)..."
 
-# ----------------------------- Tagging via beets -----------------------------
+# ----------------------------- Tagging via beets (batch mode) ----------------
 #
-# Singleton mode (-s), since individual files (not whole albums) are
-# processed - this way already correctly tagged files in the same folder
-# stay untouched.
+# Batch import: collect BATCH_IMPORT_SIZE files and pass them together to beet.
+# This is much faster than single-file imports. Singleton mode (-s) ensures
+# already correctly tagged files in the same folder stay untouched.
+
+BATCH_FILES=()
 
 while IFS= read -r file; do
   [ -f "$file" ] || continue
-  log "Processing: $file"
-  run_logged beet -c "$BEETS_CONFIG" import -q -s "$file" \
-    || err "WARNING: Could not automatically tag '$file' (no confident match found)."
+  BATCH_FILES+=("$file")
+
+  # When batch reaches BATCH_IMPORT_SIZE, process it
+  if [ ${#BATCH_FILES[@]} -ge "$BATCH_IMPORT_SIZE" ]; then
+    log "Processing batch of ${#BATCH_FILES[@]} files..."
+    run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}" \
+      || err "WARNING: Some files in batch could not be automatically tagged (no confident match)."
+    BATCH_FILES=()
+  fi
 done < "$INCOMPLETE_LIST"
+
+# Process any remaining files in final batch
+if [ ${#BATCH_FILES[@]} -gt 0 ]; then
+  log "Processing final batch of ${#BATCH_FILES[@]} files..."
+  run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}" \
+    || err "WARNING: Some files in final batch could not be automatically tagged (no confident match)."
+fi
 
 # ----------------------------- Fetch cover art -------------------------------
 # fetchart/embedart run with "force: no" -> only albums/files without an
