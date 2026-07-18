@@ -578,3 +578,52 @@ def test_mark_cover_processed():
     finally:
         if os.path.exists(db_path):
             os.unlink(db_path)
+
+
+# ----------------------- Failed matches tracking & fallback ---------------
+
+
+def test_init_failed_matches_db():
+    """Failed matches database is created with correct schema."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_failed_matches_db(db_path)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='failed_matches'"
+        )
+        assert cursor.fetchone() is not None
+        conn.close()
+    finally:
+        os.unlink(db_path)
+
+
+def test_record_failed_match():
+    """Failed matches can be recorded with fallback metadata."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+    try:
+        conn = si.init_failed_matches_db(db_path)
+        filepath = "/path/to/track.mp3"
+        
+        # Record first failed match
+        si.record_failed_match(conn, filepath, "no_confident_match", 
+                              fallback_artist="The Beatles", fallback_album="Abbey Road")
+        
+        # Get the record
+        record = si.get_failed_match(conn, filepath)
+        assert record is not None
+        error_reason, attempts, fallback_artist, fallback_album = record
+        assert error_reason == "no_confident_match"
+        assert attempts == 1
+        assert fallback_artist == "The Beatles"
+        assert fallback_album == "Abbey Road"
+        
+        # Record second attempt (attempts should increment)
+        si.record_failed_match(conn, filepath, "timeout_on_acoustid")
+        record = si.get_failed_match(conn, filepath)
+        assert record[1] == 2  # attempts incremented
+        
+        conn.close()
+    finally:
+        os.unlink(db_path)

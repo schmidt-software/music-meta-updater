@@ -446,3 +446,49 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def init_failed_matches_db(db_path):
+    """Initialize or open the failed matches tracking database."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS failed_matches (
+            filepath TEXT PRIMARY KEY,
+            error_reason TEXT NOT NULL,
+            match_attempts INTEGER NOT NULL DEFAULT 1,
+            last_attempt_time REAL NOT NULL,
+            fallback_artist TEXT,
+            fallback_album TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def record_failed_match(conn, filepath, error_reason, fallback_artist=None, fallback_album=None):
+    """Record a failed match attempt with optional fallback metadata."""
+    now = time.time()
+    cursor = conn.execute(
+        "SELECT match_attempts FROM failed_matches WHERE filepath = ?",
+        (filepath,)
+    )
+    row = cursor.fetchone()
+    attempts = (row[0] if row else 0) + 1
+    
+    conn.execute(
+        """INSERT OR REPLACE INTO failed_matches
+           (filepath, error_reason, match_attempts, last_attempt_time, fallback_artist, fallback_album)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (filepath, error_reason, attempts, now, fallback_artist, fallback_album)
+    )
+    conn.commit()
+
+
+def get_failed_match(conn, filepath):
+    """Get failed match info for a file."""
+    cursor = conn.execute(
+        """SELECT error_reason, match_attempts, fallback_artist, fallback_album 
+           FROM failed_matches WHERE filepath = ?""",
+        (filepath,)
+    )
+    return cursor.fetchone()
