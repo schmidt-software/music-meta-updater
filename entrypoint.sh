@@ -36,7 +36,25 @@ if [ -z "$SCHEDULE" ]; then
 else
   # Recurring mode: setup supercronic
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running in recurring mode with schedule: $SCHEDULE"
-  
+
+  # Validate the cron expression before it gets interpolated into the
+  # crontab file below - an invalid/malformed SCHEDULE (wrong field count,
+  # stray tokens) must be rejected here with a clear error, not silently
+  # written into the crontab and left for supercronic's own parser (or
+  # worse, misinterpreted as extra fields/commands) to discover later.
+  if ! PYTHONPATH="$SCRIPT_DIR" python3 -c '
+import sys
+import schedule_utils as su
+
+valid, error = su.validate_cron_expression(sys.argv[1])
+if not valid:
+    print(f"Invalid SCHEDULE cron expression: {error}", file=sys.stderr)
+    sys.exit(1)
+' "$SCHEDULE"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: SCHEDULE is not a valid 5-field cron expression: '$SCHEDULE'" >&2
+    exit 1
+  fi
+
   # Create a crontab file for supercronic
   CRONTAB_FILE="$WORK_DIR/crontab"
   cat > "$CRONTAB_FILE" <<EOF
