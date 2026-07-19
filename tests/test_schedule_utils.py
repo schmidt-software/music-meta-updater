@@ -73,3 +73,62 @@ def test_common_schedules():
     for schedule in common:
         valid, _ = su.validate_cron_expression(schedule)
         assert valid is True
+
+
+# ----------------------- Threshold Validation Tests ----------------------
+
+
+def test_validate_threshold_valid():
+    """Valid thresholds are accepted."""
+    valid_thresholds = ["0.0", "0.50", "0.85", "0.95", "1.0"]
+    for threshold in valid_thresholds:
+        valid, value = su.validate_threshold(threshold)
+        assert valid is True, f"Expected valid for {threshold}"
+        assert isinstance(value, float)
+
+
+def test_validate_threshold_invalid_format():
+    """Invalid formats are rejected."""
+    invalid = ["abc", "1.5%", "", "0.85.50"]
+    for threshold in invalid:
+        valid, error = su.validate_threshold(threshold)
+        assert valid is False, f"Expected invalid for {threshold}"
+
+
+def test_validate_threshold_out_of_range():
+    """Out-of-range thresholds are rejected."""
+    invalid = ["-0.5", "1.5", "2.0"]
+    for threshold in invalid:
+        valid, error = su.validate_threshold(threshold)
+        assert valid is False, f"Expected invalid for {threshold}"
+
+
+def test_describe_threshold():
+    """Threshold descriptions are generated."""
+    descriptions = {
+        0.95: "Conservative",
+        0.85: "Balanced",
+        0.70: "Aggressive",
+        0.50: "Very aggressive",
+    }
+    for threshold, expected_keyword in descriptions.items():
+        desc = su.describe_threshold(threshold)
+        assert expected_keyword.lower() in desc.lower()
+
+
+def test_threshold_boundaries():
+    """Threshold boundary values are handled correctly."""
+    # Minimum
+    valid, value = su.validate_threshold("0.0")
+    assert valid and value == 0.0
+    
+    # Maximum
+    valid, value = su.validate_threshold("1.0")
+    assert valid and value == 1.0
+    
+    # Just outside bounds
+    valid, _ = su.validate_threshold("1.1")
+    assert valid is False
+    
+    valid, _ = su.validate_threshold("-0.1")
+    assert valid is False

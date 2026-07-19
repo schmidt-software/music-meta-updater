@@ -119,3 +119,47 @@ if __name__ == "__main__":
         valid, error = validate_cron_expression(schedule)
         desc = describe_cron_expression(schedule) if valid else f"Invalid: {error}"
         print(f"{schedule:20} -> {desc}")
+
+
+def validate_threshold(threshold_str):
+    """Validate a matching confidence threshold.
+    
+    Args:
+        threshold_str: String representation of threshold (e.g., "0.85")
+    
+    Returns:
+        (True, float_value) if valid, (False, error_msg) if invalid.
+    """
+    if not threshold_str:
+        return False, "Threshold cannot be empty"
+    
+    try:
+        threshold = float(threshold_str)
+    except ValueError:
+        return False, f"Threshold must be a number, got: {threshold_str}"
+    
+    if threshold < 0.0 or threshold > 1.0:
+        return False, f"Threshold must be between 0.0 and 1.0, got: {threshold}"
+    
+    return True, threshold
+
+
+def describe_threshold(threshold):
+    """Generate a human-readable description of a threshold value.
+    
+    Args:
+        threshold: Float value between 0.0 and 1.0
+    
+    Returns:
+        Description string
+    """
+    if threshold >= 0.95:
+        return "Ultra-conservative (almost no matches)"
+    elif threshold >= 0.90:
+        return "Conservative (strict matching, recommended for classical/jazz)"
+    elif threshold >= 0.80:
+        return "Balanced (default, recommended for pop/rock)"
+    elif threshold >= 0.60:
+        return "Aggressive (higher tagging rate, recommended for compilations)"
+    else:
+        return "Very aggressive (many false positives)"
