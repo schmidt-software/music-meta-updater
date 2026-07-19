@@ -30,6 +30,8 @@
 #   BATCH_IMPORT_SIZE  -> files per beet import call (default: 50)
 #   SCAN_WORKERS       -> parallel file checking threads (default: CPU count + 1, max 8)
 #   WEBHOOK_URL        -> POST JSON health check to this URL on completion
+#                         (must be https://, must not point at a
+#                         loopback/private/link-local address)
 #
 # ---------------------------------------------------------------------------
 
@@ -141,9 +143,12 @@ EOF
 
   # Send to webhook if configured
   if [ -n "$WEBHOOK_URL" ]; then
-    log "Sending metrics to webhook: $WEBHOOK_URL"
-    if command -v curl >/dev/null 2>&1; then
+    if ! is_safe_webhook_url "$WEBHOOK_URL"; then
+      err "WARNING: WEBHOOK_URL rejected - must be https:// and must not point at a loopback/private/link-local address. Not sending webhook."
+    elif command -v curl >/dev/null 2>&1; then
+      log "Sending metrics to webhook: $WEBHOOK_URL"
       curl -s -X POST "$WEBHOOK_URL" \
+        --max-time 10 --connect-timeout 5 \
         -H "Content-Type: application/json" \
         -d @"$METRICS_FILE" \
         || err "WARNING: Failed to send webhook notification"
@@ -151,6 +156,31 @@ EOF
       err "WARNING: curl not available, cannot send webhook notification"
     fi
   fi
+}
+
+# Reject webhook destinations that are obviously unsafe to POST internal
+# file paths / error text to: non-https schemes, and loopback/link-local/
+# private-range hosts (a basic SSRF guard - WEBHOOK_URL should be treated
+# as a trusted, operator-only setting, but this adds defense in depth).
+is_safe_webhook_url() {
+  local url="$1"
+  if [[ ! "$url" =~ ^https:// ]]; then
+    return 1
+  fi
+  local host="${url#https://}"
+  host="${host%%/*}"
+  host="${host%%@*}"  # drop any userinfo@
+  host="${host##*@}"
+  host="${host%%:*}"  # drop port
+  case "$host" in
+    localhost|127.*|0.0.0.0|169.254.*|10.*|192.168.*|"")
+      return 1
+      ;;
+  esac
+  if [[ "$host" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+    return 1
+  fi
+  return 0
 }
 
 # ----------------------------- Pre-checks -----------------------------------
@@ -316,8 +346,11 @@ while IFS= read -r file; do
   # When batch reaches BATCH_IMPORT_SIZE, process it
   if [ ${#BATCH_FILES[@]} -ge "$BATCH_IMPORT_SIZE" ]; then
     log "Processing batch of ${#BATCH_FILES[@]} files..."
-    run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}" \
-      || err "WARNING: Some files in batch could not be automatically tagged (no confident match)."
+    if run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}"; then
+      TAGGED_FILES=$((TAGGED_FILES + ${#BATCH_FILES[@]}))
+    else
+      err "WARNING: Some files in batch could not be automatically tagged (no confident match)."
+    fi
     PROCESSED_FILES=$((PROCESSED_FILES + ${#BATCH_FILES[@]}))
     BATCH_FILES=()
   fi
@@ -326,12 +359,13 @@ done < "$INCOMPLETE_LIST"
 # Process any remaining files in final batch
 if [ ${#BATCH_FILES[@]} -gt 0 ]; then
   log "Processing final batch of ${#BATCH_FILES[@]} files..."
-  run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}" \
-    || err "WARNING: Some files in final batch could not be automatically tagged (no confident match)."
+  if run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}"; then
+    TAGGED_FILES=$((TAGGED_FILES + ${#BATCH_FILES[@]}))
+  else
+    err "WARNING: Some files in final batch could not be automatically tagged (no confident match)."
+  fi
   PROCESSED_FILES=$((PROCESSED_FILES + ${#BATCH_FILES[@]}))
 fi
-
-TAGGED_FILES=$PROCESSED_FILES
 
 # ----------------------------- Fetch cover art -------------------------------
 # fetchart/embedart run with "force: no" -> only albums/files without an
