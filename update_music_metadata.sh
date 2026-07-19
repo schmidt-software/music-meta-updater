@@ -60,6 +60,7 @@ VENV_DIR="$WORK_DIR/venv"
 BEETS_CONFIG="$WORK_DIR/beets_config.yaml"
 BEETS_LIBRARY="$WORK_DIR/library.db"
 MTIME_DB="$WORK_DIR/mtime_tracking.db"
+ERROR_DB="$WORK_DIR/error_tracking.db"
 LOG_FILE="$WORK_DIR/update.log"
 INCOMPLETE_LIST="$WORK_DIR/incomplete_files.lst"
 BEETS_IMPORT_LOG="$WORK_DIR/beets_import.log"
@@ -261,21 +262,35 @@ fi
 
 log "Scanning $MUSIC_DIR for files without cover art or metadata (parallel mode)..."
 
-# Build scan_incomplete.py arguments
-SCAN_ARGS=("$MUSIC_DIR" "$INCOMPLETE_LIST" "$MTIME_DB")
+# Build scan_incomplete.py arguments. Order must match scan_incomplete.py's
+# main(): music_dir, out_file, mtime_db, error_db, [num_workers].
+SCAN_ARGS=("$MUSIC_DIR" "$INCOMPLETE_LIST" "$MTIME_DB" "$ERROR_DB")
 if [ -n "$SCAN_WORKERS" ]; then
   SCAN_ARGS+=("$SCAN_WORKERS")
 fi
 
-run_logged python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}"
+# Run the scan exactly once, capturing its stdout to a temp file (in
+# addition to the log) so the summary line can be parsed afterwards.
+# Do NOT re-run the scan a second time to "capture the final line" - by
+# the time a second scan would run, mtime tracking has already been
+# updated for every file the first scan just looked at, so a second
+# invocation would see everything as "unchanged since last scan" and
+# report ~0 incomplete files, silently skipping the tagging step below.
+SCAN_OUTPUT_FILE="$WORK_DIR/scan_output.tmp"
+python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}" \
+  > >(tee -a "$LOG_FILE" "$SCAN_OUTPUT_FILE") \
+  2> >(tee -a "$LOG_FILE" >&2)
 
-# Parse scan output for metrics (run again to capture the final line)
-SCAN_OUTPUT=$(python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}" 2>&1 | grep "audio files checked" | tail -1)
-if [[ $SCAN_OUTPUT =~ ([0-9]+)\ audio\ files\ checked,\ ([0-9]+)\ incomplete ]]; then
+SCAN_SUMMARY_LINE=$(grep "audio files checked" "$SCAN_OUTPUT_FILE" | tail -1)
+rm -f "$SCAN_OUTPUT_FILE"
+if [[ $SCAN_SUMMARY_LINE =~ ([0-9]+)\ audio\ files\ checked,\ ([0-9]+)\ incomplete ]]; then
   TOTAL_FILES="${BASH_REMATCH[1]}"
-  INCOMPLETE_FILES="${BASH_REMATCH[2]}"
-  log "Scan complete: $TOTAL_FILES files checked, $INCOMPLETE_FILES incomplete"
 fi
+# The incomplete count comes from the actual list scan_incomplete.py
+# wrote, not from re-parsing log text - it's the authoritative source
+# and can't drift out of sync with what the tagging step below reads.
+INCOMPLETE_FILES=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
+log "Scan complete: $TOTAL_FILES files checked, $INCOMPLETE_FILES incomplete"
 
 if [ "$INCOMPLETE_FILES" -eq 0 ]; then
   log "All files already have cover art and metadata. Nothing to do."
