@@ -15,6 +15,10 @@
 #                       "0 2 * * *"    -> daily at 2 AM
 #                       "0 */6 * * *"  -> every 6 hours
 #                       "0 0 * * 0"    -> weekly on Sunday at midnight
+# SCAN_WORKERS     -> optional, number of files checked concurrently while
+#                     scanning (default 8) - raise this on high-latency
+#                     network mounts where each file check is a network
+#                     round trip
 
 services:
   music-metadata-updater:
@@ -24,11 +28,11 @@ services:
       MUSIC_DIR: /music
       ACOUSTID_API_KEY: ${ACOUSTID_API_KEY:-}
       SCHEDULE: ${SCHEDULE:-}
-      # Optional performance tuning:
-      # SCAN_WORKERS: 4           # default: CPU count + 1, max 8
-      # BATCH_IMPORT_SIZE: 100    # default: 50
+      SCAN_WORKERS: ${SCAN_WORKERS:-8}
+      # Optional tagging/monitoring tuning:
       # TAGGING_MODE: strict      # default, strict, aggressive, cover_only
-      # Optional monitoring:
+      # STRONG_REC_THRESH: 0.85   # overrides TAGGING_MODE's preset if set
+      # COVER_SOURCES: musicbrainz,amazon,discogs
       # WEBHOOK_URL: https://your-webhook.example.com/notify
     volumes:
       # Host's mounted music storage is mounted 1:1 into the container.

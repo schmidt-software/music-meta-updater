@@ -5,6 +5,12 @@ updates any files missing cover art or metadata from the internet
 (MusicBrainz + Cover Art Archive via `beets`). Runs fully
 non-interactively.
 
+Scanning checks multiple files concurrently (`SCAN_WORKERS`, default 8 -
+tune this up on high-latency network mounts where each file check is a
+network round trip), and each file gets tagged/cover-art-updated the
+moment it's found incomplete, rather than waiting for the whole scan to
+finish first.
+
 ## Setup
 
 ```bash
@@ -19,21 +25,36 @@ only be guessed from the filename, which is much less reliable.
 
 ## Files
 
-- `update_music_metadata.sh` – Main script. Scans all audio files with
-  Python/mutagen for missing tags (title/artist/album) or missing
-  cover art, and only lets `beets` automatically tag/cover those files.
-  Leaves already-complete files untouched and doesn't move/rename
-  anything (existing folder structure is preserved). Features incremental
-  scanning, parallel file checking, and batch beet imports for performance.
+- `update_music_metadata.sh` – Main script. Sets up the Python venv and
+  beets config (including tagging-mode/threshold and cover-source
+  settings), then hands off to `scan_incomplete.py` for scanning and
+  tagging, and emits exit codes / JSON metrics / an optional webhook
+  notification on completion. Leaves already-complete files untouched
+  and doesn't move/rename anything (existing folder structure is
+  preserved).
 - `Dockerfile` – Image with all dependencies (python3, chromaprint/fpcalc,
   ffmpeg, beets, mutagen, pyacoustid).
 - `docker-compose.yml` – Mounts the music folder to `/music` plus a
-  persistent volume `/data` for the beets database, mtime tracking DB, and logs.
+  persistent volume `/data` for the beets database, metrics, and logs.
 - `.env.example` – Template for the host path and AcoustID key.
-- `scan_incomplete.py` – Detection logic (missing cover/tags) used by
-  `update_music_metadata.sh`, kept in its own module so it's unit testable.
-  Supports incremental mode (mtime tracking) and parallel file checking.
-- `tests/` – Unit tests for `scan_incomplete.py` (incremental, parallel, combined).
+- `scan_incomplete.py` – Scans all audio files with Python/mutagen for
+  missing tags (title/artist/album) or missing cover art (`has_cover`,
+  `has_basic_tags`), checking multiple files concurrently via a thread
+  pool. The moment a file is found incomplete, it's handed to a single
+  update worker thread that runs `beet import` (tagging) then `beet
+  fetchart`/`embedart` scoped to just that file (`path:<file>`) - so
+  updates start immediately instead of waiting for the whole scan to
+  finish. Kept in its own module so the logic is unit testable.
+- `tagging_modes.py` / `schedule_utils.py` / `cover_sources.py` –
+  validation and config-generation helpers for `TAGGING_MODE`/
+  `STRONG_REC_THRESH`, `SCHEDULE` (cron), and `COVER_SOURCES`
+  respectively, used by `update_music_metadata.sh`/`entrypoint.sh`.
+- `metadata_fallback.py` – Best-effort artist/album extraction from
+  folder names, for future use as a fallback when beets can't find a
+  confident match.
+- `entrypoint.sh` – Container entrypoint: runs once (one-shot) or sets
+  up `supercronic` for recurring execution when `SCHEDULE` is set.
+- `tests/` – Unit tests for the modules above.
 
 ## Supported mount types
 
@@ -107,37 +128,29 @@ container) for later inspection.
 ## Tests
 
 Unit tests cover the detection logic in `scan_incomplete.py` (missing
-cover art / missing tags / directory scan / incremental mtime tracking /
-parallel file checking) with mocked mutagen objects and temporary SQLite
-databases, so they run without needing real audio files.
+cover art / missing tags, the per-file check/update/heartbeat helpers,
+and a `scan_and_update` integration test) with mocked mutagen objects
+and a fake `subprocess.run`, so they run without needing real audio
+files or beets installed.
 
 ```bash
 pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-## Performance Optimizations
+## Performance
 
-### Incremental Scanning
+`scan_incomplete.py` checks audio files concurrently using a pool of
+worker threads (I/O-bound work, so concurrency helps a lot on network
+mounts). By default it uses 8 worker threads; the moment a file is
+found incomplete, it's handed off to a single dedicated update worker
+thread that runs `beet import`/`fetchart`/`embedart` scoped to just
+that file - so tagging starts immediately instead of waiting for the
+whole scan to finish first. A background heartbeat prints progress
+every few seconds so long-running scans on large/slow mounts don't
+look stuck.
 
-`scan_incomplete.py` tracks file modification times (mtime) in a SQLite
-database (`mtime_tracking.db` in `$WORK_DIR`). This means:
-
-- **First run:** Scans all audio files in the library (may take a while)
-- **Subsequent runs:** Only scans files that have been modified since the last run
-- **Much faster on stable libraries:** If your library hasn't changed, subsequent
-  runs complete in seconds instead of minutes/hours
-
-The mtime database is stored in the `/data` persistent volume (Docker) or
-`$WORK_DIR` (direct invocation), so tracking persists across runs.
-
-### Parallel File Scanning
-
-`scan_incomplete.py` now scans audio files in parallel using multi-threading.
-By default, it uses `CPU_count + 1` worker threads (capped at 8) for maximum
-throughput. This dramatically speeds up initial scans on large libraries.
-
-Control the number of workers via the `SCAN_WORKERS` environment variable:
+Control the number of scan workers via the `SCAN_WORKERS` environment variable:
 
 ```bash
 SCAN_WORKERS=4 MUSIC_DIR=/music ./update_music_metadata.sh
@@ -148,26 +161,6 @@ Or in `docker-compose.yml` environment section:
 environment:
   SCAN_WORKERS: "4"
 ```
-
-### Batch Import
-
-`update_music_metadata.sh` now batches multiple files per `beet import` call
-instead of processing one file at a time. This reduces process startup overhead
-and improves overall speed. Batch size is configurable via `BATCH_IMPORT_SIZE`
-(default: 50 files).
-
-```bash
-BATCH_IMPORT_SIZE=100 MUSIC_DIR=/music ./update_music_metadata.sh
-```
-
-Or in `docker-compose.yml`:
-```yaml
-environment:
-  BATCH_IMPORT_SIZE: "100"
-```
-
-**Combined impact:** Typical speedup of **3-5x on large libraries** (1000+ files)
-compared to single-threaded, single-file processing.
 
 ## Monitoring & Integration
 

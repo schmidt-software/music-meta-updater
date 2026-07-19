@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # - supercronic  -> cron-like scheduler for recurring execution
 # - curl         -> for webhook notifications
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromaprint \
+        libchromaprint-tools \
         ffmpeg \
         python3-venv \
         ca-certificates \

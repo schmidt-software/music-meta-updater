@@ -27,8 +27,7 @@
 #   MUSIC_DIR=/path/to/music ACOUSTID_API_KEY=xxxxx ./update_music_metadata.sh
 #
 # Environment variables (optional):
-#   BATCH_IMPORT_SIZE  -> files per beet import call (default: 50)
-#   SCAN_WORKERS       -> parallel file checking threads (default: CPU count + 1, max 8)
+#   SCAN_WORKERS       -> parallel file-checking threads (default: 8)
 #   WEBHOOK_URL        -> POST JSON health check to this URL on completion
 #                         (must be https://, must not point at a
 #                         loopback/private/link-local address)
@@ -52,11 +51,8 @@ MUSIC_DIR="${MUSIC_DIR:-/path/to/music}"
 # Optional AcoustID API key for audio fingerprinting (recommended).
 ACOUSTID_API_KEY="${ACOUSTID_API_KEY:-}"
 
-# Parallel scanning: number of worker threads (optional, auto-detected if not set)
-SCAN_WORKERS="${SCAN_WORKERS:-}"
-
-# Batch import: files per beet import call
-BATCH_IMPORT_SIZE="${BATCH_IMPORT_SIZE:-50}"
+# Parallel scanning: number of worker threads (read directly from the
+# environment by scan_incomplete.py; default 8 if unset).
 
 # Optional webhook for health check notifications
 WEBHOOK_URL="${WEBHOOK_URL:-}"
@@ -73,8 +69,6 @@ WORK_DIR="${WORK_DIR:-$HOME/.music-metadata-tool}"
 VENV_DIR="$WORK_DIR/venv"
 BEETS_CONFIG="$WORK_DIR/beets_config.yaml"
 BEETS_LIBRARY="$WORK_DIR/library.db"
-MTIME_DB="$WORK_DIR/mtime_tracking.db"
-ERROR_DB="$WORK_DIR/error_tracking.db"
 LOG_FILE="$WORK_DIR/update.log"
 INCOMPLETE_LIST="$WORK_DIR/incomplete_files.lst"
 BEETS_IMPORT_LOG="$WORK_DIR/beets_import.log"
@@ -109,8 +103,8 @@ err() {
 # appending both streams to LOG_FILE for later inspection.
 run_logged() {
   "$@" \
-    > >(tee -a "$LOG_FILE") \
-    2> >(tee -a "$LOG_FILE" >&2)
+    > >(stdbuf -oL tee -a "$LOG_FILE") \
+    2> >(stdbuf -oL tee -a "$LOG_FILE" >&2)
 }
 
 # Generate JSON health check output
@@ -347,92 +341,36 @@ else
   log "No AcoustID key/fpcalc found - detection will rely only on existing tags/filenames (less reliable)."
 fi
 
-# ----------------------------- Find files with missing data -----------------
+# ----------------------------- Scan + update ---------------------------------
+#
+# scan_incomplete.py checks files for missing cover art/tags with a pool of
+# worker threads (SCAN_WORKERS, default 8 - I/O-bound, so concurrency helps
+# a lot on network mounts) and, the moment a file is found incomplete,
+# hands it to beets (import -s, then fetchart/embedart scoped to just that
+# item) right away instead of waiting for the whole scan to finish first.
 
-log "Scanning $MUSIC_DIR for files without cover art or metadata (parallel mode)..."
+log "Scanning $MUSIC_DIR for files without cover art or metadata, updating as they're found..."
 
-# Build scan_incomplete.py arguments. Order must match scan_incomplete.py's
-# main(): music_dir, out_file, mtime_db, error_db, [num_workers].
-SCAN_ARGS=("$MUSIC_DIR" "$INCOMPLETE_LIST" "$MTIME_DB" "$ERROR_DB")
-if [ -n "$SCAN_WORKERS" ]; then
-  SCAN_ARGS+=("$SCAN_WORKERS")
-fi
-
-# Run the scan exactly once, capturing its stdout to a temp file (in
-# addition to the log) so the summary line can be parsed afterwards.
-# Do NOT re-run the scan a second time to "capture the final line" - by
-# the time a second scan would run, mtime tracking has already been
-# updated for every file the first scan just looked at, so a second
-# invocation would see everything as "unchanged since last scan" and
-# report ~0 incomplete files, silently skipping the tagging step below.
+# Capture stdout to a temp file (in addition to the log) so the summary
+# line can be parsed afterwards for metrics.
 SCAN_OUTPUT_FILE="$WORK_DIR/scan_output.tmp"
-python3 "$SCRIPT_DIR/scan_incomplete.py" "${SCAN_ARGS[@]}" \
-  > >(tee -a "$LOG_FILE" "$SCAN_OUTPUT_FILE") \
-  2> >(tee -a "$LOG_FILE" >&2)
+python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST" "$BEETS_CONFIG" \
+  > >(stdbuf -oL tee -a "$LOG_FILE" "$SCAN_OUTPUT_FILE") \
+  2> >(stdbuf -oL tee -a "$LOG_FILE" >&2)
 
 SCAN_SUMMARY_LINE=$(grep "audio files checked" "$SCAN_OUTPUT_FILE" | tail -1)
 rm -f "$SCAN_OUTPUT_FILE"
-if [[ $SCAN_SUMMARY_LINE =~ ([0-9]+)\ audio\ files\ checked,\ ([0-9]+)\ incomplete ]]; then
+if [[ $SCAN_SUMMARY_LINE =~ ([0-9]+)\ audio\ files\ checked,\ ([0-9]+)\ incomplete,\ ([0-9]+)\ updated,\ ([0-9]+)\ failed ]]; then
   TOTAL_FILES="${BASH_REMATCH[1]}"
-fi
-# The incomplete count comes from the actual list scan_incomplete.py
-# wrote, not from re-parsing log text - it's the authoritative source
-# and can't drift out of sync with what the tagging step below reads.
-INCOMPLETE_FILES=$(wc -l < "$INCOMPLETE_LIST" | tr -d ' ')
-log "Scan complete: $TOTAL_FILES files checked, $INCOMPLETE_FILES incomplete"
-
-if [ "$INCOMPLETE_FILES" -eq 0 ]; then
-  log "All files already have cover art and metadata. Nothing to do."
-  deactivate
-  emit_metrics 0
-  exit 0
-fi
-
-log "$INCOMPLETE_FILES file(s) without cover/metadata found. Starting automatic tagging (batch mode)..."
-
-# ----------------------------- Tagging via beets (batch mode) ----------------
-#
-# Batch import: collect BATCH_IMPORT_SIZE files and pass them together to beet.
-# This is much faster than single-file imports. Singleton mode (-s) ensures
-# already correctly tagged files in the same folder stay untouched.
-
-BATCH_FILES=()
-
-while IFS= read -r file; do
-  [ -f "$file" ] || continue
-  BATCH_FILES+=("$file")
-
-  # When batch reaches BATCH_IMPORT_SIZE, process it
-  if [ ${#BATCH_FILES[@]} -ge "$BATCH_IMPORT_SIZE" ]; then
-    log "Processing batch of ${#BATCH_FILES[@]} files..."
-    if run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}"; then
-      TAGGED_FILES=$((TAGGED_FILES + ${#BATCH_FILES[@]}))
-    else
-      err "WARNING: Some files in batch could not be automatically tagged (no confident match)."
-    fi
-    PROCESSED_FILES=$((PROCESSED_FILES + ${#BATCH_FILES[@]}))
-    BATCH_FILES=()
+  INCOMPLETE_FILES="${BASH_REMATCH[2]}"
+  PROCESSED_FILES="${BASH_REMATCH[2]}"
+  TAGGED_FILES="${BASH_REMATCH[3]}"
+  FAILED_FILES="${BASH_REMATCH[4]}"
+  log "Scan complete: $TOTAL_FILES checked, $INCOMPLETE_FILES incomplete, $TAGGED_FILES tagged, $FAILED_FILES failed"
+  if [ "$FAILED_FILES" -gt 0 ]; then
+    err "WARNING: $FAILED_FILES file(s) could not be automatically tagged (no confident match) - see log for details."
   fi
-done < "$INCOMPLETE_LIST"
-
-# Process any remaining files in final batch
-if [ ${#BATCH_FILES[@]} -gt 0 ]; then
-  log "Processing final batch of ${#BATCH_FILES[@]} files..."
-  if run_logged beet -c "$BEETS_CONFIG" import -q -s "${BATCH_FILES[@]}"; then
-    TAGGED_FILES=$((TAGGED_FILES + ${#BATCH_FILES[@]}))
-  else
-    err "WARNING: Some files in final batch could not be automatically tagged (no confident match)."
-  fi
-  PROCESSED_FILES=$((PROCESSED_FILES + ${#BATCH_FILES[@]}))
 fi
-
-# ----------------------------- Fetch cover art -------------------------------
-# fetchart/embedart run with "force: no" -> only albums/files without an
-# existing cover are touched.
-
-log "Fetching missing cover art..."
-run_logged beet -c "$BEETS_CONFIG" fetchart -q || true
-run_logged beet -c "$BEETS_CONFIG" embedart -q || true
 
 deactivate
 

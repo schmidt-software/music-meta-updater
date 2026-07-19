@@ -1,6 +1,5 @@
 import sys
 import os
-import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -38,8 +37,22 @@ def test_has_cover_mp4_covr():
     assert si.has_cover(mf) is True
 
 
+def test_has_cover_wma_picture():
+    mf = FakeMF(tags=FakeTags({"WM/Picture": [b"..."]}))
+    assert si.has_cover(mf) is True
+
+
 def test_has_cover_flac_pictures():
     mf = FakeMF(tags=FakeTags({}), pictures=["picture-data"])
+    assert si.has_cover(mf) is True
+
+
+def test_has_cover_flac_pictures_without_any_tags_block():
+    """A FLAC with an embedded picture but zero VORBIS_COMMENT tags has
+    mf.tags is None (confirmed against real mutagen.flac.FLAC) - the
+    pictures check must not be nested inside a "tags is not None" guard,
+    or files like this are wrongly reported as missing a cover."""
+    mf = FakeMF(tags=None, pictures=["picture-data"])
     assert si.has_cover(mf) is True
 
 
@@ -106,10 +119,146 @@ def test_has_basic_tags_no_tags():
     assert si.has_basic_tags(mf) is False
 
 
-# --------------------------- find_incomplete (returns 3-tuple now) --------
+# ----------------------------- _check_file -------------------------------
 
 
-def test_find_incomplete(tmp_path, monkeypatch):
+def test_check_file_ok(monkeypatch):
+    mf = FakeMF(tags=FakeTags({
+        "APIC:cover": b"...",
+        "title": ["T"], "artist": ["A"], "album": ["Al"],
+    }))
+    monkeypatch.setattr(si, "MutagenFile", lambda path: mf)
+    assert si._check_file("/music/song.mp3") == ("ok", None)
+
+
+def test_check_file_incomplete_missing_cover(monkeypatch):
+    mf = FakeMF(tags=FakeTags({"title": ["T"], "artist": ["A"], "album": ["Al"]}))
+    monkeypatch.setattr(si, "MutagenFile", lambda path: mf)
+    assert si._check_file("/music/song.mp3") == ("incomplete", None)
+
+
+def test_check_file_warns_on_read_error(monkeypatch):
+    def raising(path):
+        raise ValueError("cannot parse")
+    monkeypatch.setattr(si, "MutagenFile", raising)
+    kind, msg = si._check_file("/music/corrupt.mp3")
+    assert kind == "warn"
+    assert "could not read" in msg
+
+
+def test_check_file_warns_on_unknown_format(monkeypatch):
+    monkeypatch.setattr(si, "MutagenFile", lambda path: None)
+    kind, msg = si._check_file("/music/weird.mp3")
+    assert kind == "warn"
+    assert "unknown/corrupt format" in msg
+
+
+# ----------------------------- _update_file -------------------------------
+
+
+class FakeCompletedProcess:
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+
+def test_update_file_success_runs_import_fetchart_embedart():
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return FakeCompletedProcess(0)
+
+    ok = si._update_file("/music/song.mp3", "/data/beets_config.yaml", run=fake_run)
+
+    assert ok is True
+    assert calls[0] == ["beet", "-v", "-c", "/data/beets_config.yaml",
+                         "import", "-q", "-s", "/music/song.mp3"]
+    assert calls[1] == ["beet", "-v", "-c", "/data/beets_config.yaml",
+                         "fetchart", "-q", "path:/music/song.mp3"]
+    assert calls[2] == ["beet", "-v", "-c", "/data/beets_config.yaml",
+                         "embedart", "-y", "path:/music/song.mp3"]
+
+
+def test_update_file_import_failure_skips_fetchart_embedart(capsys):
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return FakeCompletedProcess(1)
+
+    ok = si._update_file("/music/song.mp3", "/data/beets_config.yaml", run=fake_run)
+
+    assert ok is False
+    assert len(calls) == 1
+    assert "Could not automatically tag" in capsys.readouterr().err
+
+
+# --------------------------- _updater_worker ------------------------------
+
+
+def test_updater_worker_processes_queue_until_sentinel():
+    import queue as queue_mod
+
+    work_queue = queue_mod.Queue()
+    work_queue.put("/music/a.mp3")
+    work_queue.put("/music/b.mp3")
+    work_queue.put(None)
+
+    processed = []
+
+    def fake_update(file_path, beets_config_path):
+        processed.append(file_path)
+        return file_path != "/music/b.mp3"  # simulate one success, one failure
+
+    state = {"updated": 0, "failed": 0}
+    si._updater_worker(work_queue, "/data/beets_config.yaml", state, update_fn=fake_update)
+
+    assert processed == ["/music/a.mp3", "/music/b.mp3"]
+    assert state["updated"] == 1
+    assert state["failed"] == 1
+
+
+# ----------------------------- _heartbeat ---------------------------------
+
+
+class FakeStopEvent:
+    """Stands in for threading.Event: wait() returns the next canned value
+    instead of actually sleeping, so the heartbeat loop can be driven
+    deterministically without real threads/timing."""
+
+    def __init__(self, wait_returns):
+        self._returns = iter(wait_returns)
+
+    def wait(self, timeout):
+        return next(self._returns)
+
+
+def test_heartbeat_prints_once_per_tick(capsys, monkeypatch):
+    monkeypatch.setattr(si.time, "monotonic", lambda: 105.0)
+    state = {"checked": 42, "incomplete": 3, "updated": 2, "failed": 1}
+    stop_event = FakeStopEvent([False, False, True])
+
+    si._heartbeat(state, stop_event, start_time=100.0, interval=5.0)
+
+    out = capsys.readouterr().out
+    expected = ("Scanning: 42 files checked so far "
+                "(3 incomplete found, 2 updated, 1 failed, 5s elapsed)\n")
+    assert out == expected * 2
+
+
+def test_heartbeat_stops_immediately_when_event_already_set(capsys):
+    state = {"checked": 0, "incomplete": 0, "updated": 0, "failed": 0}
+    stop_event = FakeStopEvent([True])
+
+    si._heartbeat(state, stop_event, start_time=100.0)
+
+    assert capsys.readouterr().out == ""
+
+
+# --------------------------- scan_and_update ------------------------------
+
+
+def test_scan_and_update(tmp_path, monkeypatch):
     complete = tmp_path / "complete.mp3"
     complete.write_bytes(b"")
     missing_cover = tmp_path / "missing_cover.mp3"
@@ -143,17 +292,30 @@ def test_find_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
 
-    total, incomplete, errors = si.find_incomplete(str(tmp_path))
+    updated_paths = []
 
-    assert total == 4  # all *.mp3/*.flac files, txt excluded
+    def fake_update_file(file_path, beets_config_path, run=None):
+        updated_paths.append(file_path)
+        return True
+
+    monkeypatch.setattr(si, "_update_file", fake_update_file)
+
+    out_file = tmp_path / "incomplete.lst"
+    checked, incomplete, updated, failed = si.scan_and_update(
+        str(tmp_path), "/data/beets_config.yaml", str(out_file), max_scan_workers=2)
+
+    assert checked == 4  # all *.mp3/*.flac files, txt excluded
     assert str(complete) not in incomplete
     assert str(missing_cover) in incomplete
     assert str(missing_tags) in incomplete
     assert str(corrupt) not in incomplete
-    assert isinstance(errors, dict)
+    assert sorted(updated_paths) == sorted([str(missing_cover), str(missing_tags)])
+    assert updated == 2
+    assert failed == 0
+    assert set(out_file.read_text().splitlines()) == {str(missing_cover), str(missing_tags)}
 
 
-def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
+def test_scan_and_update_reports_directory_listing_errors(tmp_path, monkeypatch, capsys):
     """A transient error listing a subdirectory (common on flaky network
     mounts) must be reported, not silently swallowed, and must not abort
     the scan."""
@@ -164,523 +326,13 @@ def test_find_incomplete_reports_directory_listing_errors(tmp_path, monkeypatch,
 
     monkeypatch.setattr(si.os, "walk", fake_walk)
 
-    total, incomplete, errors = si.find_incomplete(str(tmp_path))
+    out_file = tmp_path / "incomplete.lst"
+    checked, incomplete, updated, failed = si.scan_and_update(
+        str(tmp_path), "/data/beets_config.yaml", str(out_file))
 
     captured = capsys.readouterr()
     assert "could not list directory" in captured.err
-    assert total == 0
+    assert checked == 0
     assert incomplete == []
-
-
-# ----------------------- Error tracking & resilience --------------------
-
-
-def test_init_error_db():
-    """Error tracking database is created with correct schema."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_error_db(db_path)
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='error_tracking'"
-        )
-        assert cursor.fetchone() is not None
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_record_and_check_error():
-    """Errors can be recorded and files can be blacklisted."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_error_db(db_path)
-        filepath = "/path/to/flaky_file.mp3"
-        
-        # Record an error
-        si.record_error(conn, filepath, "io_error", "Connection timeout", blacklist_duration=1)
-        
-        # File should be blacklisted
-        assert si.is_blacklisted(conn, filepath) is True
-        
-        # Wait for blacklist to expire
-        import time
-        time.sleep(1.1)
-        
-        # File should no longer be blacklisted
-        assert si.is_blacklisted(conn, filepath) is False
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_get_error_type():
-    """Error classification works correctly."""
-    assert si.get_error_type(PermissionError("denied")) == "permission_error"
-    assert si.get_error_type(FileNotFoundError("missing")) == "file_not_found"
-    assert si.get_error_type(OSError("io error")) == "io_error"
-    # TimeoutError is a subclass of OSError, so it must be checked before
-    # the generic OSError branch to actually be classified as "timeout".
-    assert si.get_error_type(TimeoutError("timeout")) == "timeout"
-    assert si.get_error_type(ValueError("other")) == "unknown_error"
-
-
-def test_error_telemetry_collection():
-    """Error telemetry is collected correctly."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mtime.db") as f:
-        mtime_db = f.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".error.db") as f:
-        error_db = f.name
-    
-    try:
-        # Create a tmp_path with audio files
-        import tempfile as tmplib
-        with tmplib.TemporaryDirectory() as tmp_dir:
-            file1 = os.path.join(tmp_dir, "track.mp3")
-            open(file1, "w").close()
-            
-            # Mock MutagenFile to raise errors
-            original_check_file = si._check_file_with_retry
-            call_count = [0]
-            
-            def mock_check_file(path, mtime_db_path=None, error_db_path=None):
-                call_count[0] += 1
-                # Simulate I/O error
-                if call_count[0] <= si.MAX_RETRIES:
-                    raise OSError("Simulated I/O error")
-                # After retries, record error
-                return (path, False, True, ("io_error", "Simulated I/O error"))
-            
-            si._check_file_with_retry = mock_check_file
-            try:
-                total, incomplete, errors = si.find_incomplete(tmp_dir, mtime_db, error_db, num_workers=1)
-                # Should have captured io_error
-                assert "io_error" in errors or len(errors) > 0
-            finally:
-                si._check_file_with_retry = original_check_file
-    finally:
-        if os.path.exists(mtime_db):
-            os.unlink(mtime_db)
-        if os.path.exists(error_db):
-            os.unlink(error_db)
-
-
-# ----------------------- Incremental mtime tracking ----------------------
-
-
-def test_init_mtime_db():
-    """Database is created with the correct schema."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_mtime_db(db_path)
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_mtime_tracking'"
-        )
-        assert cursor.fetchone() is not None
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_mtime_tracking_get_and_update():
-    """Mtime can be stored and retrieved."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_mtime_db(db_path)
-        filepath = "/path/to/file.mp3"
-        mtime = 1234567890.5
-
-        # Initially not tracked
-        assert si.get_tracked_mtime(conn, filepath) is None
-
-        # Update and retrieve
-        si.update_mtime_tracking(conn, filepath, mtime)
-        assert si.get_tracked_mtime(conn, filepath) == mtime
-
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_find_incomplete_incremental_mode_skips_unchanged(tmp_path, monkeypatch):
-    """In incremental mode, files with unchanged mtime are skipped."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-
-    try:
-        unchanged = tmp_path / "unchanged.mp3"
-        unchanged.write_bytes(b"")
-        changed = tmp_path / "changed.mp3"
-        changed.write_bytes(b"")
-
-        # Pre-populate DB with unchanged file
-        conn = si.init_mtime_db(db_path)
-        unchanged_mtime = os.path.getmtime(str(unchanged))
-        si.update_mtime_tracking(conn, str(unchanged), unchanged_mtime)
-        conn.close()
-
-        unchanged_mf = FakeMF(tags=FakeTags())  # incomplete (missing tags)
-        changed_mf = FakeMF(tags=FakeTags())    # incomplete
-
-        call_count = {"unchanged": 0, "changed": 0}
-
-        def fake_mutagen_file(path):
-            if str(unchanged) in path:
-                call_count["unchanged"] += 1
-                return unchanged_mf
-            elif str(changed) in path:
-                call_count["changed"] += 1
-                return changed_mf
-            return None
-
-        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
-
-        # First incremental scan: unchanged file should be skipped
-        total, incomplete, _ = si.find_incomplete(str(tmp_path), db_path)
-
-        # unchanged file's MutagenFile should NOT have been called
-        # (it's been skipped due to matching mtime)
-        assert call_count["unchanged"] == 0
-        # changed file WAS scanned
-        assert call_count["changed"] == 1
-        assert str(changed) in incomplete
-        assert str(unchanged) not in incomplete
-    finally:
-        os.unlink(db_path)
-
-
-def test_find_incomplete_incremental_detects_file_changes(tmp_path, monkeypatch):
-    """When a file is modified, incremental scan detects it."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-
-    try:
-        file_to_modify = tmp_path / "track.mp3"
-        file_to_modify.write_bytes(b"old content")
-
-        # First scan: record current mtime
-        conn = si.init_mtime_db(db_path)
-        initial_mtime = os.path.getmtime(str(file_to_modify))
-        si.update_mtime_tracking(conn, str(file_to_modify), initial_mtime)
-        conn.close()
-
-        # Modify the file (change content + mtime)
-        import time
-        time.sleep(0.01)  # ensure mtime differs
-        file_to_modify.write_bytes(b"new content")
-
-        scan_count = {"count": 0}
-
-        def fake_mutagen_file(path):
-            scan_count["count"] += 1
-            return FakeMF(tags=FakeTags())  # incomplete
-
-        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
-
-        # Second scan: file should be rescanned because mtime changed
-        total, incomplete, _ = si.find_incomplete(str(tmp_path), db_path)
-
-        assert scan_count["count"] > 0  # file WAS scanned
-        assert str(file_to_modify) in incomplete
-    finally:
-        os.unlink(db_path)
-
-
-def test_find_incomplete_retains_incomplete_files_across_scans(tmp_path, monkeypatch):
-    """A file that remains incomplete (e.g. beets couldn't find a
-    confident match) must keep being reported on every subsequent scan,
-    not just the first - its mtime must not get cached as "tracked"
-    while it's still incomplete, or it would be silently skipped
-    forever even though it was never actually fixed."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-
-    try:
-        still_incomplete = tmp_path / "still_incomplete.mp3"
-        still_incomplete.write_bytes(b"")
-
-        call_count = {"count": 0}
-
-        def fake_mutagen_file(path):
-            call_count["count"] += 1
-            return FakeMF(tags=FakeTags())  # always incomplete
-
-        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
-
-        # First scan: file is incomplete.
-        _, incomplete1, _ = si.find_incomplete(str(tmp_path), db_path)
-        assert str(still_incomplete) in incomplete1
-
-        # File is NOT modified in between (simulating beets failing to fix
-        # it). The second scan must still report it.
-        _, incomplete2, _ = si.find_incomplete(str(tmp_path), db_path)
-        assert str(still_incomplete) in incomplete2
-        assert call_count["count"] == 2  # scanned both times, never skipped
-    finally:
-        os.unlink(db_path)
-
-
-# ----------------------- Parallel file checking -----------------------
-
-
-def test_find_incomplete_invalid_num_workers_falls_back(tmp_path, monkeypatch, capsys):
-    """num_workers <= 0 must not crash the scan (ThreadPoolExecutor
-    rejects non-positive max_workers) - fall back to the default worker
-    count instead, with a warning."""
-    file1 = tmp_path / "track.mp3"
-    file1.write_bytes(b"")
-
-    def fake_mutagen_file(path):
-        return FakeMF(tags=FakeTags({
-            "APIC:cover": b"...",
-            "title": ["T"], "artist": ["A"], "album": ["Al"],
-        }))
-
-    monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
-
-    total, incomplete, _ = si.find_incomplete(str(tmp_path), num_workers=0)
-    assert total == 1
-    assert incomplete == []
-    captured = capsys.readouterr()
-    assert "invalid num_workers" in captured.err
-
-
-def test_find_incomplete_with_parallel_workers(tmp_path, monkeypatch):
-    """Parallel scan with multiple workers produces same results as single-threaded."""
-    file1 = tmp_path / "track1.mp3"
-    file1.write_bytes(b"")
-    file2 = tmp_path / "track2.mp3"
-    file2.write_bytes(b"")
-    file3 = tmp_path / "track3.mp3"
-    file3.write_bytes(b"")
-
-    # Mock mutagen: file1 complete, file2/file3 incomplete
-    complete_mf = FakeMF(tags=FakeTags({
-        "APIC:cover": b"...",
-        "title": ["T"], "artist": ["A"], "album": ["Al"],
-    }))
-    incomplete_mf = FakeMF(tags=FakeTags())
-
-    by_name = {
-        str(file1): complete_mf,
-        str(file2): incomplete_mf,
-        str(file3): incomplete_mf,
-    }
-
-    def fake_mutagen_file(path):
-        return by_name.get(path)
-
-    monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
-
-    # Single-threaded scan
-    _, incomplete_single, _ = si.find_incomplete(str(tmp_path), None, None, num_workers=1)
-
-    # Multi-threaded scan
-    _, incomplete_multi, _ = si.find_incomplete(str(tmp_path), None, None, num_workers=4)
-
-    # Results should be identical
-    assert set(incomplete_single) == set(incomplete_multi)
-    assert len(incomplete_multi) == 2
-    assert str(file1) not in incomplete_multi
-    assert str(file2) in incomplete_multi
-    assert str(file3) in incomplete_multi
-
-
-def test_find_incomplete_parallel_with_incremental(tmp_path, monkeypatch):
-    """Parallel + incremental mode work together."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-
-    try:
-        file1 = tmp_path / "track1.mp3"
-        file1.write_bytes(b"")
-        file2 = tmp_path / "track2.mp3"
-        file2.write_bytes(b"")
-
-        # Pre-populate DB with file1 (unchanged)
-        conn = si.init_mtime_db(db_path)
-        mtime1 = os.path.getmtime(str(file1))
-        si.update_mtime_tracking(conn, str(file1), mtime1)
-        conn.close()
-
-        incomplete_mf = FakeMF(tags=FakeTags())
-
-        call_count = {"file1": 0, "file2": 0}
-
-        def fake_mutagen_file(path):
-            if str(file1) in path:
-                call_count["file1"] += 1
-            elif str(file2) in path:
-                call_count["file2"] += 1
-            return incomplete_mf
-
-        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
-
-        # Parallel + incremental scan
-        _, incomplete, _ = si.find_incomplete(str(tmp_path), db_path, None, num_workers=2)
-
-        # file1 should be skipped (unchanged mtime)
-        # file2 should be scanned
-        assert call_count["file1"] == 0  # skipped
-        assert call_count["file2"] == 1  # scanned
-        assert str(file2) in incomplete
-        assert str(file1) not in incomplete
-    finally:
-        os.unlink(db_path)
-
-
-# ----------------------- Cover tracking & incremental fetching ----------
-
-
-def test_init_cover_db():
-    """Cover tracking database is created with correct schema."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_cover_db(db_path)
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='cover_tracking'"
-        )
-        assert cursor.fetchone() is not None
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_cover_tracking_get_and_update():
-    """Cover mtime can be stored and retrieved."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_cover_db(db_path)
-        filepath = "/path/to/file.mp3"
-        mtime = 1234567890.5
-
-        # Initially not tracked
-        assert si.get_cover_mtime(conn, filepath) is None
-
-        # Update and retrieve
-        si.update_cover_tracking(conn, filepath, mtime, cover_status="success")
-        assert si.get_cover_mtime(conn, filepath) == mtime
-
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_find_files_needing_cover_update(tmp_path):
-    """Identifies files that need cover re-fetching due to mtime change."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-
-    try:
-        file1 = tmp_path / "processed.mp3"
-        file1.write_bytes(b"")
-        file2 = tmp_path / "new.mp3"
-        file2.write_bytes(b"")
-        file3 = tmp_path / "modified.mp3"
-        file3.write_bytes(b"old")
-
-        # Pre-populate DB with file1 and file3 (with old mtime)
-        conn = si.init_cover_db(db_path)
-        mtime1 = os.path.getmtime(str(file1))
-        si.update_cover_tracking(conn, str(file1), mtime1, "success")
-        
-        # file3: store old mtime
-        old_mtime = mtime1 - 100
-        si.update_cover_tracking(conn, str(file3), old_mtime, "success")
-        conn.close()
-
-        # Modify file3 to change mtime
-        import time
-        time.sleep(0.01)
-        file3.write_bytes(b"new")
-
-        # Find files needing update
-        files_needing_update = si.find_files_needing_cover_update(str(tmp_path), db_path)
-
-        # file1: processed and unchanged -> should NOT be in list
-        # file2: never seen -> should be in list
-        # file3: modified -> should be in list
-        assert str(file1) not in files_needing_update
-        assert str(file2) in files_needing_update
-        assert str(file3) in files_needing_update
-    finally:
-        if os.path.exists(db_path):
-            os.unlink(db_path)
-
-
-def test_mark_cover_processed():
-    """Cover processing status can be marked for a file."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
-            filepath = f.name
-
-        # Mark as processed
-        si.mark_cover_processed(db_path, filepath, "success")
-
-        # Verify it was tracked
-        conn = si.init_cover_db(db_path)
-        mtime_tracked = si.get_cover_mtime(conn, filepath)
-        assert mtime_tracked is not None
-        conn.close()
-        
-        os.unlink(filepath)
-    finally:
-        if os.path.exists(db_path):
-            os.unlink(db_path)
-
-
-# ----------------------- Failed matches tracking & fallback ---------------
-
-
-def test_init_failed_matches_db():
-    """Failed matches database is created with correct schema."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_failed_matches_db(db_path)
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='failed_matches'"
-        )
-        assert cursor.fetchone() is not None
-        conn.close()
-    finally:
-        os.unlink(db_path)
-
-
-def test_record_failed_match():
-    """Failed matches can be recorded with fallback metadata."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-        db_path = f.name
-    try:
-        conn = si.init_failed_matches_db(db_path)
-        filepath = "/path/to/track.mp3"
-        
-        # Record first failed match
-        si.record_failed_match(conn, filepath, "no_confident_match", 
-                              fallback_artist="The Beatles", fallback_album="Abbey Road")
-        
-        # Get the record
-        record = si.get_failed_match(conn, filepath)
-        assert record is not None
-        error_reason, attempts, fallback_artist, fallback_album = record
-        assert error_reason == "no_confident_match"
-        assert attempts == 1
-        assert fallback_artist == "The Beatles"
-        assert fallback_album == "Abbey Road"
-        
-        # Record second attempt (attempts should increment)
-        si.record_failed_match(conn, filepath, "timeout_on_acoustid")
-        record = si.get_failed_match(conn, filepath)
-        assert record[1] == 2  # attempts incremented
-        
-        conn.close()
-    finally:
-        os.unlink(db_path)
+    assert updated == 0
+    assert failed == 0
