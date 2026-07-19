@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Cover art fallback chain configuration and management.
+
+Implements a configurable fallback chain for cover art fetching:
+  1. MusicBrainz Cover Art Archive (CAA) - default source
+  2. Amazon Cover Art
+  3. Discogs
+  4. Local cache (previously downloaded covers)
+  5. Placeholder (last resort)
+"""
+
+import os
+
+
+# Default fallback chain configuration
+DEFAULT_COVER_SOURCES = [
+    "musicbrainz",      # MusicBrainz Cover Art Archive (CAA)
+    "amazon",           # Amazon Cover Art
+    "discogs",          # Discogs
+]
+
+# Extended chain with local cache and placeholder
+EXTENDED_COVER_SOURCES = [
+    "musicbrainz",
+    "amazon",
+    "discogs",
+    "local",            # Local cache
+    "placeholder",      # Generated placeholder
+]
+
+
+def validate_cover_sources(sources):
+    """Validate a list of cover sources.
+    
+    Valid sources: musicbrainz, amazon, discogs, local, placeholder
+    
+    Returns (True, None) if valid, (False, error_msg) if invalid.
+    """
+    valid_sources = {"musicbrainz", "amazon", "discogs", "local", "placeholder"}
+    
+    if not sources:
+        return False, "Cover sources list cannot be empty"
+    
+    if not isinstance(sources, list):
+        return False, "Cover sources must be a list"
+    
+    for source in sources:
+        if source not in valid_sources:
+            return False, f"Unknown cover source: {source}. Valid: {', '.join(valid_sources)}"
+    
+    return True, None
+
+
+def parse_cover_sources_string(sources_str):
+    """Parse a comma-separated string of cover sources.
+    
+    Args:
+        sources_str: "musicbrainz,amazon,discogs" or empty string
+    
+    Returns:
+        (sources_list, error) tuple or (DEFAULT_COVER_SOURCES, None) if empty
+    """
+    if not sources_str or not sources_str.strip():
+        return DEFAULT_COVER_SOURCES, None
+    
+    sources = [s.strip().lower() for s in sources_str.split(",")]
+    valid, error = validate_cover_sources(sources)
+    
+    if not valid:
+        return None, error
+    
+    return sources, None
+
+
+def generate_beets_fetchart_config(sources):
+    """Generate beets fetchart config section for given sources.
+    
+    Args:
+        sources: List of cover sources in order
+    
+    Returns:
+        YAML config string for beets fetchart section
+    """
+    valid, error = validate_cover_sources(sources)
+    if not valid:
+        raise ValueError(f"Invalid cover sources: {error}")
+    
+    # Map source names to beets plugin names
+    source_plugins = {
+        "musicbrainz": "MusicBrainz",
+        "amazon": "Amazon",
+        "discogs": "Discogs",
+    }
+    
+    # Build beets sources list
+    beets_sources = []
+    for source in sources:
+        if source in source_plugins:
+            beets_sources.append(source_plugins[source])
+    
+    # If no valid beets sources, use default
+    if not beets_sources:
+        beets_sources = ["MusicBrainz"]
+    
+    # Generate YAML config
+    config = f"""fetchart:
+  auto: yes
+  force: no
+  enforce_ratio: no
+  sources: {beets_sources}
+  # Fallback behavior:
+  # - cover_only: skip_cover=false (try all sources)
+  # - strict/aggressive/default: all sources enabled
+"""
+    
+    return config
+
+
+def describe_cover_sources(sources):
+    """Generate human-readable description of cover sources chain.
+    
+    Args:
+        sources: List of cover sources
+    
+    Returns:
+        Description string
+    """
+    descriptions = {
+        "musicbrainz": "MusicBrainz Cover Art Archive",
+        "amazon": "Amazon Cover Art",
+        "discogs": "Discogs",
+        "local": "Local Cache",
+        "placeholder": "Generated Placeholder",
+    }
+    
+    parts = []
+    for source in sources:
+        if source in descriptions:
+            parts.append(descriptions[source])
+    
+    return " → ".join(parts) if parts else "No sources configured"
+
+
+if __name__ == "__main__":
+    # Test
+    test_chains = [
+        DEFAULT_COVER_SOURCES,
+        EXTENDED_COVER_SOURCES,
+        ["musicbrainz", "amazon"],
+        ["invalid"],
+    ]
+    
+    for chain in test_chains:
+        valid, error = validate_cover_sources(chain)
+        if valid:
+            print(f"✓ {describe_cover_sources(chain)}")
+        else:
+            print(f"✗ {error}")
