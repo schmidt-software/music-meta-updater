@@ -103,10 +103,12 @@ def get_error_type(exception):
         return "permission_error"
     elif isinstance(exception, FileNotFoundError):
         return "file_not_found"
+    elif isinstance(exception, TimeoutError):
+        # TimeoutError is a subclass of OSError, so it must be checked
+        # before the generic OSError branch or it's never reachable.
+        return "timeout"
     elif isinstance(exception, OSError):
         return "io_error"
-    elif isinstance(exception, TimeoutError):
-        return "timeout"
     else:
         return "unknown_error"
 
@@ -233,15 +235,15 @@ def _check_file_with_retry(path, mtime_db_path=None, error_db_path=None):
 
     # Incremental check: skip if mtime hasn't changed
     if mtime_db_path:
+        mtime_conn = None
         try:
             current_mtime = os.path.getmtime(path)
-            conn = init_mtime_db(mtime_db_path)
-            tracked_mtime = get_tracked_mtime(conn, path)
-            conn.close()
+            mtime_conn = init_mtime_db(mtime_db_path)
+            tracked_mtime = get_tracked_mtime(mtime_conn, path)
             if tracked_mtime is not None and current_mtime == tracked_mtime:
                 # File hasn't changed; skip it
                 return (path, False, False, None)
-        except OSError as e:
+        except (OSError, sqlite3.Error) as e:
             error_type = get_error_type(e)
             error_msg = str(e)
             if error_db_conn:
@@ -249,6 +251,9 @@ def _check_file_with_retry(path, mtime_db_path=None, error_db_path=None):
                 error_db_conn.close()
             print(f"WARN: could not stat {path} ({error_type}: {error_msg})", file=sys.stderr)
             return (path, False, False, (error_type, error_msg))
+        finally:
+            if mtime_conn:
+                mtime_conn.close()
 
     # Try to read and check the file with exponential backoff
     last_exception = None
@@ -259,29 +264,40 @@ def _check_file_with_retry(path, mtime_db_path=None, error_db_path=None):
                 if error_db_conn:
                     error_db_conn.close()
                 return (path, False, True, None)
-            
+
             missing_cover = not has_cover(mf)
             missing_tags = not has_basic_tags(mf)
             is_incomplete = missing_cover or missing_tags
-            
+
             if error_db_conn:
                 error_db_conn.close()
-            return (path, is_incomplete, True, None)
+            # Only remember this file's mtime when it's complete. If it's
+            # still incomplete, beets may fail to fix it (no confident
+            # match, network hiccup, etc.) - keep re-surfacing it on every
+            # subsequent scan until it actually changes or gets fixed.
+            return (path, is_incomplete, not is_incomplete, None)
         except Exception as e:
             last_exception = e
-            if attempt < MAX_RETRIES - 1:
+            # Only retry exceptions plausibly caused by transient mount
+            # flakiness (OSError and its subclasses, e.g. TimeoutError,
+            # ConnectionError, PermissionError). Permanent failures, like a
+            # corrupt/unsupported file mutagen can't parse, will fail the
+            # same way every time - fail fast instead of wasting retries.
+            is_retryable = isinstance(e, OSError)
+            if is_retryable and attempt < MAX_RETRIES - 1:
                 # Exponential backoff before retry
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
                 time.sleep(delay)
-            else:
-                # Final attempt failed, record error
-                error_type = get_error_type(e)
-                error_msg = str(e)
-                if error_db_conn:
-                    record_error(error_db_conn, path, error_type, error_msg)
-                    error_db_conn.close()
-                print(f"WARN: could not read {path} after {MAX_RETRIES} attempts ({error_type}: {error_msg})", file=sys.stderr)
-                return (path, False, True, (error_type, error_msg))
+                continue
+
+            error_type = get_error_type(e)
+            error_msg = str(e)
+            if error_db_conn:
+                record_error(error_db_conn, path, error_type, error_msg)
+                error_db_conn.close()
+            attempts_made = attempt + 1
+            print(f"WARN: could not read {path} after {attempts_made} attempt(s) ({error_type}: {error_msg})", file=sys.stderr)
+            return (path, False, True, (error_type, error_msg))
 
     # Shouldn't reach here, but handle just in case
     if error_db_conn:
@@ -304,6 +320,9 @@ def find_incomplete(music_dir, mtime_db_path=None, error_db_path=None, num_worke
     error_telemetry is a dict with error_type -> count mapping.
     """
     if num_workers is None:
+        num_workers = DEFAULT_WORKERS
+    elif num_workers < 1:
+        print(f"WARN: invalid num_workers={num_workers} (must be >= 1), using default ({DEFAULT_WORKERS})", file=sys.stderr)
         num_workers = DEFAULT_WORKERS
 
     # First pass: collect all audio files to check
@@ -348,7 +367,7 @@ def find_incomplete(music_dir, mtime_db_path=None, error_db_path=None, num_worke
                     except OSError:
                         pass
             except Exception as e:
-                print(f"WARN: unexpected error checking file ({e})", file=sys.stderr)
+                print(f"WARN: unexpected error checking file {futures[future]} ({e})", file=sys.stderr)
                 error_telemetry["unexpected_error"] = error_telemetry.get("unexpected_error", 0) + 1
 
     # Batch write mtime tracking (after all workers finish)

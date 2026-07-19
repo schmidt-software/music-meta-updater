@@ -220,8 +220,9 @@ def test_get_error_type():
     assert si.get_error_type(PermissionError("denied")) == "permission_error"
     assert si.get_error_type(FileNotFoundError("missing")) == "file_not_found"
     assert si.get_error_type(OSError("io error")) == "io_error"
-    # TimeoutError is subclass of OSError, so it's classified as io_error
-    assert si.get_error_type(TimeoutError("timeout")) == "io_error"
+    # TimeoutError is a subclass of OSError, so it must be checked before
+    # the generic OSError branch to actually be classified as "timeout".
+    assert si.get_error_type(TimeoutError("timeout")) == "timeout"
     assert si.get_error_type(ValueError("other")) == "unknown_error"
 
 
@@ -388,7 +389,63 @@ def test_find_incomplete_incremental_detects_file_changes(tmp_path, monkeypatch)
         os.unlink(db_path)
 
 
+def test_find_incomplete_retains_incomplete_files_across_scans(tmp_path, monkeypatch):
+    """A file that remains incomplete (e.g. beets couldn't find a
+    confident match) must keep being reported on every subsequent scan,
+    not just the first - its mtime must not get cached as "tracked"
+    while it's still incomplete, or it would be silently skipped
+    forever even though it was never actually fixed."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+        db_path = f.name
+
+    try:
+        still_incomplete = tmp_path / "still_incomplete.mp3"
+        still_incomplete.write_bytes(b"")
+
+        call_count = {"count": 0}
+
+        def fake_mutagen_file(path):
+            call_count["count"] += 1
+            return FakeMF(tags=FakeTags())  # always incomplete
+
+        monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
+
+        # First scan: file is incomplete.
+        _, incomplete1, _ = si.find_incomplete(str(tmp_path), db_path)
+        assert str(still_incomplete) in incomplete1
+
+        # File is NOT modified in between (simulating beets failing to fix
+        # it). The second scan must still report it.
+        _, incomplete2, _ = si.find_incomplete(str(tmp_path), db_path)
+        assert str(still_incomplete) in incomplete2
+        assert call_count["count"] == 2  # scanned both times, never skipped
+    finally:
+        os.unlink(db_path)
+
+
 # ----------------------- Parallel file checking -----------------------
+
+
+def test_find_incomplete_invalid_num_workers_falls_back(tmp_path, monkeypatch, capsys):
+    """num_workers <= 0 must not crash the scan (ThreadPoolExecutor
+    rejects non-positive max_workers) - fall back to the default worker
+    count instead, with a warning."""
+    file1 = tmp_path / "track.mp3"
+    file1.write_bytes(b"")
+
+    def fake_mutagen_file(path):
+        return FakeMF(tags=FakeTags({
+            "APIC:cover": b"...",
+            "title": ["T"], "artist": ["A"], "album": ["Al"],
+        }))
+
+    monkeypatch.setattr(si, "MutagenFile", fake_mutagen_file)
+
+    total, incomplete, _ = si.find_incomplete(str(tmp_path), num_workers=0)
+    assert total == 1
+    assert incomplete == []
+    captured = capsys.readouterr()
+    assert "invalid num_workers" in captured.err
 
 
 def test_find_incomplete_with_parallel_workers(tmp_path, monkeypatch):
