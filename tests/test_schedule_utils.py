@@ -114,6 +114,18 @@ def test_describe_threshold():
     for threshold, expected_keyword in descriptions.items():
         desc = su.describe_threshold(threshold)
         assert expected_keyword.lower() in desc.lower()
+        # 0.95 must land in the "Conservative" bucket, not "Ultra-conservative"
+        # (regression test for a bucket-boundary off-by-one) - a plain
+        # substring check can't tell these two apart, so check explicitly.
+        if threshold == 0.95:
+            assert not desc.lower().startswith("ultra-")
+
+
+def test_describe_threshold_ultra_conservative_bucket():
+    """Only >= 0.99 is classified as ultra-conservative."""
+    assert su.describe_threshold(0.99).lower().startswith("ultra-conservative")
+    assert su.describe_threshold(1.0).lower().startswith("ultra-conservative")
+    assert not su.describe_threshold(0.95).lower().startswith("ultra-conservative")
 
 
 def test_threshold_boundaries():

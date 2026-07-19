@@ -32,6 +32,11 @@
 #   WEBHOOK_URL        -> POST JSON health check to this URL on completion
 #                         (must be https://, must not point at a
 #                         loopback/private/link-local address)
+#   TAGGING_MODE       -> default|strict|aggressive|cover_only (default: default)
+#   STRONG_REC_THRESH  -> beets matching confidence threshold 0.0-1.0,
+#                         overrides TAGGING_MODE's preset if set
+#   COVER_SOURCES      -> comma-separated cover art fallback chain, e.g.
+#                         "musicbrainz,amazon,discogs" (default chain if unset)
 #
 # ---------------------------------------------------------------------------
 
@@ -55,6 +60,13 @@ BATCH_IMPORT_SIZE="${BATCH_IMPORT_SIZE:-50}"
 
 # Optional webhook for health check notifications
 WEBHOOK_URL="${WEBHOOK_URL:-}"
+
+# Tagging mode / matching confidence (optional)
+TAGGING_MODE="${TAGGING_MODE:-default}"
+STRONG_REC_THRESH="${STRONG_REC_THRESH:-}"
+
+# Cover art fallback chain (optional)
+COVER_SOURCES="${COVER_SOURCES:-}"
 
 # Working directory for venv, beets config and logs.
 WORK_DIR="${WORK_DIR:-$HOME/.music-metadata-tool}"
@@ -231,6 +243,56 @@ if command -v fpcalc >/dev/null 2>&1 && [ -n "$ACOUSTID_API_KEY" ]; then
   USE_CHROMA="yes"
 fi
 
+# Resolve the beets match.strong_rec_thresh value: TAGGING_MODE selects a
+# preset (default/strict/aggressive/cover_only), STRONG_REC_THRESH - if
+# set - overrides it. Both are validated up front and fail the run
+# loudly on bad input, since this is user-editable config.
+RESOLVED_STRONG_REC_THRESH=$(PYTHONPATH="$SCRIPT_DIR" python3 -c "
+import sys
+import tagging_modes as tm
+import schedule_utils as su
+
+mode = sys.argv[1]
+override = sys.argv[2]
+
+if not tm.validate_mode(mode):
+    print(f'Unknown TAGGING_MODE: {mode}. Valid modes: {list(tm.TAGGING_MODES.keys())}', file=sys.stderr)
+    sys.exit(1)
+
+threshold = tm.get_mode_config(mode).get('strong_rec_thresh', 0.85)
+
+if override:
+    valid, value_or_error = su.validate_threshold(override)
+    if not valid:
+        print(f'Invalid STRONG_REC_THRESH: {value_or_error}', file=sys.stderr)
+        sys.exit(1)
+    threshold = value_or_error
+
+print(threshold)
+" "$TAGGING_MODE" "$STRONG_REC_THRESH") || {
+  err "ERROR: Invalid TAGGING_MODE/STRONG_REC_THRESH configuration."
+  emit_metrics 1
+  exit 1
+}
+log "Matching confidence threshold: $RESOLVED_STRONG_REC_THRESH (mode: $TAGGING_MODE)"
+
+# Resolve the beets fetchart config section from COVER_SOURCES (falls
+# back to the default musicbrainz/amazon/discogs chain if unset).
+FETCHART_CONFIG=$(PYTHONPATH="$SCRIPT_DIR" python3 -c "
+import sys
+import cover_sources as cs
+
+sources, error = cs.parse_cover_sources_string(sys.argv[1])
+if error:
+    print(f'Invalid COVER_SOURCES: {error}', file=sys.stderr)
+    sys.exit(1)
+sys.stdout.write(cs.generate_beets_fetchart_config(sources))
+" "$COVER_SOURCES") || {
+  err "ERROR: Invalid COVER_SOURCES configuration."
+  emit_metrics 1
+  exit 1
+}
+
 # ----------------------------- beets configuration ---------------------------
 #
 # Important:
@@ -259,16 +321,13 @@ import:
   log: $BEETS_IMPORT_LOG
 
 match:
+  strong_rec_thresh: $RESOLVED_STRONG_REC_THRESH
   preferred:
     media: ['CD', 'Digital Media']
 
 plugins: fetchart embedart$( [ "$USE_CHROMA" = "yes" ] && echo " chroma" )
 
-fetchart:
-  auto: yes
-  force: no
-  enforce_ratio: no
-
+$FETCHART_CONFIG
 embedart:
   auto: yes
   ifempty: yes

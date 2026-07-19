@@ -10,6 +10,7 @@ Implements a configurable fallback chain for cover art fetching:
 """
 
 import os
+import sys
 
 
 # Default fallback chain configuration
@@ -80,24 +81,41 @@ def generate_beets_fetchart_config(sources):
     
     Returns:
         YAML config string for beets fetchart section
+
+    Note: "local" and "placeholder" are not beets fetchart plugin
+    sources - they represent this project's own local-cache/placeholder
+    fallback concept, handled outside of beets (if at all). If present
+    in `sources`, they are intentionally excluded from the generated
+    config; a warning is printed to stderr so this isn't silent.
     """
     valid, error = validate_cover_sources(sources)
     if not valid:
         raise ValueError(f"Invalid cover sources: {error}")
-    
+
     # Map source names to beets plugin names
     source_plugins = {
         "musicbrainz": "MusicBrainz",
         "amazon": "Amazon",
         "discogs": "Discogs",
     }
-    
+
     # Build beets sources list
     beets_sources = []
+    dropped = []
     for source in sources:
         if source in source_plugins:
             beets_sources.append(source_plugins[source])
-    
+        else:
+            dropped.append(source)
+
+    if dropped:
+        print(
+            f"NOTE: cover source(s) {', '.join(dropped)} are not beets "
+            "fetchart plugins and were excluded from the generated "
+            "fetchart config (handled outside of beets, if at all).",
+            file=sys.stderr,
+        )
+
     # If no valid beets sources, use default
     if not beets_sources:
         beets_sources = ["MusicBrainz"]

@@ -153,7 +153,7 @@ def describe_threshold(threshold):
     Returns:
         Description string
     """
-    if threshold >= 0.95:
+    if threshold >= 0.99:
         return "Ultra-conservative (almost no matches)"
     elif threshold >= 0.90:
         return "Conservative (strict matching, recommended for classical/jazz)"

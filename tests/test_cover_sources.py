@@ -67,6 +67,19 @@ def test_generate_beets_fetchart_config():
     assert "Amazon" in config
 
 
+def test_generate_beets_fetchart_config_warns_on_dropped_sources(capsys):
+    """'local'/'placeholder' aren't beets plugins - they're dropped from
+    the generated config, but a warning must be printed so this isn't
+    silent (regression test)."""
+    config = cs.generate_beets_fetchart_config(cs.EXTENDED_COVER_SOURCES)
+    assert "MusicBrainz" in config
+    assert "Amazon" in config
+    assert "Discogs" in config
+    captured = capsys.readouterr()
+    assert "local" in captured.err
+    assert "placeholder" in captured.err
+
+
 def test_generate_beets_fetchart_config_invalid():
     """Invalid sources raise ValueError."""
     try:
