@@ -329,6 +329,13 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
                                 tracked_mtime, tracked_size = tracked
                                 if abs(current_mtime - tracked_mtime) <= MTIME_TOLERANCE and current_size == tracked_size:
                                     # skip this file (unchanged since last successful update)
+                                    checked += 1
+                                    state["checked"] = checked
+                                    state["incomplete"] = len(incomplete)
+                                    # record skipped for reporting but do not submit to workers
+                                    if "skipped" not in state:
+                                        state["skipped"] = 0
+                                    state["skipped"] += 1
                                     continue
                         except sqlite3.Error as e:
                             print(f"WARN: mtime DB read failed for {path} ({e})", file=sys.stderr)
@@ -370,6 +377,11 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
     with open(out_file, "w") as f:
         for p in incomplete:
             f.write(p + "\n")
+
+    # Print an additional summary line including skipped count for clarity
+    skipped = state.get("skipped", 0)
+    if skipped:
+        print(f"Summary: {checked} checked, {skipped} skipped by mtime tracking, {len(incomplete)} incomplete, {state['updated']} updated, {state['failed']} failed", flush=True)
 
     return checked, incomplete, state["updated"], state["failed"]
 
