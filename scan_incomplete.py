@@ -267,6 +267,120 @@ def prune_stale_mtime_rows(conn):
     _prune_kv_missing(conn, "file_mtime_tracking")
 
 
+# ----------------------------- Cover tracking -----------------------------
+# Implement a small cover-tracking layer using the generic KV helpers so that
+# a future incremental cover-fetch phase can avoid re-fetching covers that
+# were already successfully processed. The functions are intentionally
+# lightweight and batch-aware (no per-file commit).
+
+
+def init_cover_db(db_path):
+    """Open or create the cover tracking DB and ensure schema exists."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    _init_kv_db(conn, "cover_tracking", "mtime REAL NOT NULL, cover_status TEXT NOT NULL")
+    conn.commit()
+    return conn
+
+
+def get_cover_mtime(conn, filepath):
+    """Return (mtime, cover_status) or None."""
+    return _get_kv_row(conn, "cover_tracking", filepath, ["mtime", "cover_status"])
+
+
+def update_cover_tracking(conn, filepath, mtime, cover_status):
+    """Insert or replace cover tracking entry. Does not commit (batched)."""
+    _set_kv_row(conn, "cover_tracking", filepath, [("mtime", mtime), ("cover_status", cover_status)])
+
+
+def find_files_needing_cover_update(music_dir, cover_db_path, num_workers=None):
+    """Return list of file paths whose cover should be re-fetched.
+
+    If cover_db_path is falsy, return all audio files (no incremental filtering).
+    """
+    files = []
+    if not cover_db_path:
+        for root, _dirs, filenames in os.walk(music_dir, onerror=_on_walk_error):
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in AUDIO_EXTS:
+                    continue
+                files.append(os.path.join(root, fname))
+        return files
+
+    try:
+        conn = init_cover_db(cover_db_path)
+    except sqlite3.Error as e:
+        print(f"WARN: could not open cover DB {cover_db_path} ({e})", file=sys.stderr)
+        # Fall back to listing all files
+        return find_files_needing_cover_update(music_dir, None, num_workers=num_workers)
+
+    # Load tracked rows into memory to avoid per-file DB roundtrips
+    cur = conn.cursor()
+    cur.execute("SELECT filepath, mtime, cover_status FROM cover_tracking")
+    tracked = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+
+    try:
+        for root, _dirs, filenames in os.walk(music_dir, onerror=_on_walk_error):
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in AUDIO_EXTS:
+                    continue
+                path = os.path.join(root, fname)
+                try:
+                    current_mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+
+                tracked_row = tracked.get(path)
+                if tracked_row is None:
+                    files.append(path)
+                else:
+                    tracked_mtime, tracked_status = tracked_row
+                    # Only skip if tracked status is 'success' and mtime hasn't changed
+                    if tracked_status == 'success' and abs(current_mtime - tracked_mtime) <= MTIME_TOLERANCE:
+                        continue
+                    files.append(path)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return files
+
+
+def mark_cover_processed(conn_or_path, records):
+    """Mark multiple files as processed.
+
+    records: iterable of (filepath, cover_status). If conn_or_path is a
+    sqlite3.Connection, it is used; otherwise conn_or_path is treated as a
+    DB path and a temporary connection is opened and committed.
+    """
+    transient = False
+    if isinstance(conn_or_path, str):
+        conn = init_cover_db(conn_or_path)
+        transient = True
+    else:
+        conn = conn_or_path
+
+    try:
+        for filepath, status in records:
+            try:
+                mtime = os.path.getmtime(filepath)
+            except OSError:
+                # If file missing, skip
+                continue
+            update_cover_tracking(conn, filepath, mtime, status)
+        if transient:
+            commit_mtime_db(conn)
+    finally:
+        if transient:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None, mtime_db_path=None):
     """Walks music_dir with a pool of worker threads (I/O-bound file checks
     benefit from concurrency, especially on network mounts), dispatching
