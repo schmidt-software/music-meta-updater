@@ -224,6 +224,19 @@ def commit_mtime_db(conn):
     conn.commit()
 
 
+def prune_stale_mtime_rows(conn):
+    """Remove tracking rows whose files no longer exist on disk."""
+    cur = conn.cursor()
+    cur.execute("SELECT filepath FROM file_mtime_tracking")
+    rows = cur.fetchall()
+    to_delete = []
+    for (fp,) in rows:
+        if not os.path.exists(fp):
+            to_delete.append(fp)
+    if to_delete:
+        cur.executemany("DELETE FROM file_mtime_tracking WHERE filepath = ?", [(fp,) for fp in to_delete])
+
+
 def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None, mtime_db_path=None):
     """Walks music_dir with a pool of worker threads (I/O-bound file checks
     benefit from concurrency, especially on network mounts), dispatching
@@ -316,6 +329,11 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
         heartbeat_thread.join()
         if mtime_conn:
             try:
+                # Prune stale rows for files that were deleted/moved during scans
+                try:
+                    prune_stale_mtime_rows(mtime_conn)
+                except sqlite3.Error:
+                    pass
                 # Commit batched mtime updates made by the updater thread
                 try:
                     commit_mtime_db(mtime_conn)
