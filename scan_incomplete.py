@@ -316,8 +316,17 @@ def find_files_needing_cover_update(music_dir, cover_db_path, num_workers=None):
 
     # Load tracked rows into memory to avoid per-file DB roundtrips
     cur = conn.cursor()
-    cur.execute("SELECT filepath, mtime, cover_status FROM cover_tracking")
-    tracked = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+    tracked = {}
+    try:
+        cur.execute("SELECT filepath, mtime, cover_status FROM cover_tracking")
+        tracked = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+    except sqlite3.OperationalError:
+        # If cover_tracking table doesn't exist, fall back to file_mtime_tracking
+        try:
+            cur.execute("SELECT filepath, mtime FROM file_mtime_tracking")
+            tracked = {row[0]: (row[1], 'success') for row in cur.fetchall()}
+        except sqlite3.OperationalError:
+            tracked = {}
 
     try:
         for root, _dirs, filenames in os.walk(music_dir, onerror=_on_walk_error):
