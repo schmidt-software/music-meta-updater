@@ -210,6 +210,35 @@ environment:
 The JSON metrics are POSTed to the URL with `Content-Type: application/json`.
 Useful for Kubernetes Events, Alerting Systems, or Custom Dashboards.
 
+## Configuration additions (mtime tracking)
+
+- `MTIME_TOLERANCE` (seconds, default 1.0) — tolerance when comparing tracked mtime to filesystem mtime. Useful on filesystems with coarse timestamp resolution (NFS, some cloud mounts). Example: `MTIME_TOLERANCE=2.0`.
+
+- `MTIME_DB` / file_mtime_tracking — the tool optionally writes a small SQLite DB (table `file_mtime_tracking`) recording the last-successful-tracked mtime and file size per filepath. Important behavior change: the mtime is recorded *only after a confirmed successful* beets tagging+cover update. This prevents prematurely marking incomplete files as done but means the DB will be empty until a successful run populates it.
+
+- If operators rely on previous semantics (where files were marked differently), either run a full initial scan to populate the DB or use migration tooling (see `tools/prune_mtime_db.py` and `CHANGELOG.md` for details).
+
+## Maintenance: pruning stale tracking rows
+
+Long-running deployments or frequent library reorganizations can leave stale entries in the mtime DB for files that were deleted or moved. The scanner already prunes stale rows at the end of each scan when `MTIME_DB` is in use, but a periodic maintenance job is recommended for long-lived environments.
+
+Example cron using the included helper:
+
+```cron
+# Run daily at 03:00 to prune missing files from the tracking DB
+0 3 * * * /usr/bin/python3 /path/to/repo/tools/prune_mtime_db.py /data/mtime.db
+```
+
+You can also run the helper manually:
+
+```bash
+python3 tools/prune_mtime_db.py /path/to/mtime.db
+```
+
+## Changelog
+
+A short changelog summarising recent fixes is available in `CHANGELOG.md`.
+
 ## Open items / possible next steps
 
 - Recurring execution (cron in the container, or external scheduling)
