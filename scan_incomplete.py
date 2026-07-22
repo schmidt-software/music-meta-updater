@@ -13,6 +13,7 @@ import threading
 import queue
 import subprocess
 import concurrent.futures
+import sqlite3
 from mutagen import File as MutagenFile
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
@@ -129,37 +130,86 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
     return True
 
 
-def _updater_worker(work_queue, beets_config_path, state, update_fn=None):
-    """Consumes file paths from work_queue one at a time until it sees the
-    None sentinel, updating "state" so the heartbeat can report progress."""
+def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None):
+    """Consumes (path, mtime) tuples from work_queue one at a time until it
+    sees the None sentinel. If mtime_conn is provided, successful updates
+    are recorded to the mtime DB. Updates state for the heartbeat to report."""
     if update_fn is None:
         update_fn = _update_file
     while True:
-        file_path = work_queue.get()
-        if file_path is None:
+        item = work_queue.get()
+        if item is None:
             work_queue.task_done()
             return
-        if update_fn(file_path, beets_config_path):
+        try:
+            file_path, file_mtime = item
+        except Exception:
+            # Backwards-compat: if older callers placed just a path, accept it
+            file_path = item
+            try:
+                file_mtime = os.path.getmtime(file_path)
+            except Exception:
+                file_mtime = None
+
+        success = update_fn(file_path, beets_config_path)
+        if success:
             state["updated"] += 1
+            # Record tracked mtime only on confirmed success
+            if mtime_conn and file_mtime is not None:
+                try:
+                    update_mtime_tracking(mtime_conn, file_path, file_mtime)
+                except sqlite3.Error as e:
+                    print(f"WARN: could not update mtime DB for {file_path} ({e})", file=sys.stderr)
         else:
             state["failed"] += 1
         work_queue.task_done()
 
 
-def _handle_check_result(future, path, incomplete, work_queue, checked, state):
+def _handle_check_result(future, path_info, incomplete, work_queue, checked, state):
     kind, msg = future.result()
+    path, file_mtime = path_info
     if kind == "warn":
         print(msg, file=sys.stderr, flush=True)
     elif kind == "incomplete":
         incomplete.append(path)
-        work_queue.put(path)
+        # enqueue tuple(path, mtime) so updater can record the tracked mtime
+        work_queue.put((path, file_mtime))
     checked += 1
     state["checked"] = checked
     state["incomplete"] = len(incomplete)
     return checked
 
 
-def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None):
+def init_mtime_db(db_path):
+    """Create/open the mtime tracking DB and ensure schema exists. Returns sqlite3.Connection."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS file_mtime_tracking (
+        filepath TEXT PRIMARY KEY,
+        mtime REAL NOT NULL
+    )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_tracked_mtime(conn, filepath):
+    """Return tracked mtime (float) or None. May raise sqlite3.Error."""
+    cur = conn.cursor()
+    cur.execute("SELECT mtime FROM file_mtime_tracking WHERE filepath = ?", (filepath,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def update_mtime_tracking(conn, filepath, mtime):
+    """Insert or replace tracked mtime for filepath. May raise sqlite3.Error."""
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO file_mtime_tracking (filepath, mtime) VALUES (?, ?)", (filepath, mtime))
+    conn.commit()
+
+
+def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None, mtime_db_path=None):
     """Walks music_dir with a pool of worker threads (I/O-bound file checks
     benefit from concurrency, especially on network mounts), dispatching
     each file found missing cover art or tags to a single updater thread
@@ -180,9 +230,21 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
         target=_heartbeat, args=(state, stop_event, start_time), daemon=True)
     heartbeat_thread.start()
 
+    # Optional mtime DB: open connection once and pass it to the updater
+    mtime_conn = None
+    db_lock = None
+    if mtime_db_path:
+        try:
+            mtime_conn = init_mtime_db(mtime_db_path)
+            db_lock = threading.Lock()
+        except sqlite3.Error as e:
+            print(f"WARN: could not open mtime DB {mtime_db_path} ({e})", file=sys.stderr)
+            mtime_conn = None
+            db_lock = None
+
     work_queue = queue.Queue()
     updater_thread = threading.Thread(
-        target=_updater_worker, args=(work_queue, beets_config_path, state), daemon=True)
+        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock), daemon=True)
     updater_thread.start()
 
     try:
@@ -194,20 +256,47 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
                     if ext not in AUDIO_EXTS:
                         continue
                     path = os.path.join(root, fname)
-                    futures[pool.submit(_check_file, path)] = path
+
+                    # Capture mtime once and reuse
+                    try:
+                        current_mtime = os.path.getmtime(path)
+                    except OSError as e:
+                        print(f"WARN: could not stat {path} ({e})", file=sys.stderr)
+                        continue
+
+                    # If DB present, check tracked mtime and skip if unchanged
+                    if mtime_conn:
+                        try:
+                            tracked = get_tracked_mtime(mtime_conn, path)
+                            if tracked is not None and current_mtime == tracked:
+                                # skip this file (unchanged since last successful update)
+                                continue
+                        except sqlite3.Error as e:
+                            print(f"WARN: mtime DB read failed for {path} ({e})", file=sys.stderr)
+                            # Fall through and inspect the file rather than aborting the scan
+
+                    # Submit the check; store path + current_mtime for later
+                    futures[pool.submit(_check_file, path)] = (path, current_mtime)
+
                     for future in [f for f in futures if f.done()]:
-                        done_path = futures.pop(future)
+                        done_info = futures.pop(future)
                         checked = _handle_check_result(
-                            future, done_path, incomplete, work_queue, checked, state)
+                            future, done_info, incomplete, work_queue, checked, state)
             for future in concurrent.futures.as_completed(futures):
-                done_path = futures.pop(future)
+                done_info = futures.pop(future)
                 checked = _handle_check_result(
-                    future, done_path, incomplete, work_queue, checked, state)
+                    future, done_info, incomplete, work_queue, checked, state)
     finally:
+        # Ensure the updater is told to stop and join, and that DB connection is closed
         work_queue.put(None)
         updater_thread.join()
         stop_event.set()
         heartbeat_thread.join()
+        if mtime_conn:
+            try:
+                mtime_conn.close()
+            except Exception:
+                pass
 
     with open(out_file, "w") as f:
         for p in incomplete:
@@ -217,9 +306,13 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
 
 
 def main():
-    music_dir, out_file, beets_config_path = sys.argv[1], sys.argv[2], sys.argv[3]
-    checked, incomplete, updated, failed = scan_and_update(music_dir, out_file=out_file,
-                                                            beets_config_path=beets_config_path)
+    music_dir = sys.argv[1]
+    out_file = sys.argv[2]
+    beets_config_path = sys.argv[3]
+    mtime_db_path = sys.argv[4] if len(sys.argv) > 4 else None
+
+    checked, incomplete, updated, failed = scan_and_update(
+        music_dir, beets_config_path, out_file, mtime_db_path=mtime_db_path)
     print(f"{checked} audio files checked, {len(incomplete)} incomplete, "
           f"{updated} updated, {failed} failed.", flush=True)
 
