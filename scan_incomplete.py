@@ -14,7 +14,13 @@ import queue
 import subprocess
 import concurrent.futures
 import sqlite3
-from mutagen import File as MutagenFile
+try:
+    from mutagen import File as MutagenFile
+except Exception:
+    # Tests may run without mutagen installed; provide a noop placeholder
+    def MutagenFile(path, easy=False):
+        return None
+
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
 
