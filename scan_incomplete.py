@@ -203,9 +203,17 @@ def get_tracked_mtime(conn, filepath):
 
 
 def update_mtime_tracking(conn, filepath, mtime):
-    """Insert or replace tracked mtime for filepath. May raise sqlite3.Error."""
+    """Insert or replace tracked mtime for filepath. May raise sqlite3.Error.
+
+    NOTE: this function does NOT call conn.commit() to allow batching of
+    multiple updates. Call commit_mtime_db(conn) after a batch completes.
+    """
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO file_mtime_tracking (filepath, mtime) VALUES (?, ?)", (filepath, mtime))
+
+
+def commit_mtime_db(conn):
+    """Commit pending mtime DB changes. Safe to call if no changes were made."""
     conn.commit()
 
 
@@ -294,6 +302,11 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
         heartbeat_thread.join()
         if mtime_conn:
             try:
+                # Commit batched mtime updates made by the updater thread
+                try:
+                    commit_mtime_db(mtime_conn)
+                except sqlite3.Error:
+                    pass
                 mtime_conn.close()
             except Exception:
                 pass
