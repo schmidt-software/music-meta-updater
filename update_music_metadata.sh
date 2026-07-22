@@ -354,7 +354,7 @@ log "Scanning $MUSIC_DIR for files without cover art or metadata, updating as th
 # Capture stdout to a temp file (in addition to the log) so the summary
 # line can be parsed afterwards for metrics.
 SCAN_OUTPUT_FILE="$WORK_DIR/scan_output.tmp"
-python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST" "$BEETS_CONFIG" \
+python3 "$SCRIPT_DIR/scan_incomplete.py" "$MUSIC_DIR" "$INCOMPLETE_LIST" "$BEETS_CONFIG" "$MTIME_DB" \
   > >(stdbuf -oL tee -a "$LOG_FILE" "$SCAN_OUTPUT_FILE") \
   2> >(stdbuf -oL tee -a "$LOG_FILE" >&2)
 
