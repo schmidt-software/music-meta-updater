@@ -19,6 +19,7 @@ from mutagen import File as MutagenFile
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
 
 DEFAULT_SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "8"))
+MTIME_TOLERANCE = float(os.environ.get("MTIME_TOLERANCE", "1.0"))  # seconds tolerance for mtime comparison on coarse filesystems
 
 
 def has_cover(mf):
@@ -131,7 +132,7 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
 
 
 def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None):
-    """Consumes (path, mtime) tuples from work_queue one at a time until it
+    """Consumes (path, mtime, size) tuples from work_queue one at a time until it
     sees the None sentinel. If mtime_conn is provided, successful updates
     are recorded to the mtime DB. Updates state for the heartbeat to report."""
     if update_fn is None:
@@ -142,7 +143,7 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
             work_queue.task_done()
             return
         try:
-            file_path, file_mtime = item
+            file_path, file_mtime, file_size = item
         except Exception:
             # Backwards-compat: if older callers placed just a path, accept it
             file_path = item
@@ -150,14 +151,18 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
                 file_mtime = os.path.getmtime(file_path)
             except Exception:
                 file_mtime = None
+            try:
+                file_size = os.path.getsize(file_path)
+            except Exception:
+                file_size = None
 
         success = update_fn(file_path, beets_config_path)
         if success:
             state["updated"] += 1
-            # Record tracked mtime only on confirmed success
-            if mtime_conn and file_mtime is not None:
+            # Record tracked mtime and size only on confirmed success
+            if mtime_conn and file_mtime is not None and file_size is not None:
                 try:
-                    update_mtime_tracking(mtime_conn, file_path, file_mtime)
+                    update_mtime_tracking(mtime_conn, file_path, file_mtime, file_size)
                 except sqlite3.Error as e:
                     print(f"WARN: could not update mtime DB for {file_path} ({e})", file=sys.stderr)
         else:
@@ -167,13 +172,14 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
 
 def _handle_check_result(future, path_info, incomplete, work_queue, checked, state):
     kind, msg = future.result()
-    path, file_mtime = path_info
+    # path_info is (path, current_mtime, current_size)
+    path, file_mtime, file_size = path_info
     if kind == "warn":
         print(msg, file=sys.stderr, flush=True)
     elif kind == "incomplete":
         incomplete.append(path)
-        # enqueue tuple(path, mtime) so updater can record the tracked mtime
-        work_queue.put((path, file_mtime))
+        # enqueue tuple(path, mtime, size) so updater can record the tracked values
+        work_queue.put((path, file_mtime, file_size))
     checked += 1
     state["checked"] = checked
     state["incomplete"] = len(incomplete)
@@ -187,7 +193,8 @@ def init_mtime_db(db_path):
     cur.execute("""
     CREATE TABLE IF NOT EXISTS file_mtime_tracking (
         filepath TEXT PRIMARY KEY,
-        mtime REAL NOT NULL
+        mtime REAL NOT NULL,
+        size INTEGER NOT NULL
     )
     """)
     conn.commit()
@@ -195,21 +202,21 @@ def init_mtime_db(db_path):
 
 
 def get_tracked_mtime(conn, filepath):
-    """Return tracked mtime (float) or None. May raise sqlite3.Error."""
+    """Return (mtime, size) tuple or None. May raise sqlite3.Error."""
     cur = conn.cursor()
-    cur.execute("SELECT mtime FROM file_mtime_tracking WHERE filepath = ?", (filepath,))
+    cur.execute("SELECT mtime, size FROM file_mtime_tracking WHERE filepath = ?", (filepath,))
     row = cur.fetchone()
-    return row[0] if row else None
+    return (row[0], row[1]) if row else None
 
 
-def update_mtime_tracking(conn, filepath, mtime):
-    """Insert or replace tracked mtime for filepath. May raise sqlite3.Error.
+def update_mtime_tracking(conn, filepath, mtime, size):
+    """Insert or replace tracked mtime and size for filepath. May raise sqlite3.Error.
 
     NOTE: this function does NOT call conn.commit() to allow batching of
     multiple updates. Call commit_mtime_db(conn) after a batch completes.
     """
     cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO file_mtime_tracking (filepath, mtime) VALUES (?, ?)", (filepath, mtime))
+    cur.execute("INSERT OR REPLACE INTO file_mtime_tracking (filepath, mtime, size) VALUES (?, ?, ?)", (filepath, mtime, size))
 
 
 def commit_mtime_db(conn):
@@ -271,20 +278,27 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
                     except OSError as e:
                         print(f"WARN: could not stat {path} ({e})", file=sys.stderr)
                         continue
+                    try:
+                        current_size = os.path.getsize(path)
+                    except OSError as e:
+                        print(f"WARN: could not stat size for {path} ({e})", file=sys.stderr)
+                        continue
 
-                    # If DB present, check tracked mtime and skip if unchanged
+                    # If DB present, check tracked mtime+size and skip if unchanged
                     if mtime_conn:
                         try:
                             tracked = get_tracked_mtime(mtime_conn, path)
-                            if tracked is not None and current_mtime == tracked:
-                                # skip this file (unchanged since last successful update)
-                                continue
+                            if tracked is not None:
+                                tracked_mtime, tracked_size = tracked
+                                if abs(current_mtime - tracked_mtime) <= MTIME_TOLERANCE and current_size == tracked_size:
+                                    # skip this file (unchanged since last successful update)
+                                    continue
                         except sqlite3.Error as e:
                             print(f"WARN: mtime DB read failed for {path} ({e})", file=sys.stderr)
                             # Fall through and inspect the file rather than aborting the scan
 
-                    # Submit the check; store path + current_mtime for later
-                    futures[pool.submit(_check_file, path)] = (path, current_mtime)
+                    # Submit the check; store path + current_mtime + current_size for later
+                    futures[pool.submit(_check_file, path)] = (path, current_mtime, current_size)
 
                     for future in [f for f in futures if f.done()]:
                         done_info = futures.pop(future)

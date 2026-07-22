@@ -200,8 +200,8 @@ def test_updater_worker_processes_queue_until_sentinel():
     import queue as queue_mod
 
     work_queue = queue_mod.Queue()
-    work_queue.put(("/music/a.mp3", 1.0))
-    work_queue.put(("/music/b.mp3", 2.0))
+    work_queue.put(("/music/a.mp3", 1.0, 100))
+    work_queue.put(("/music/b.mp3", 2.0, 200))
     work_queue.put(None)
 
     processed = []
