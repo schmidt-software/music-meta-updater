@@ -186,27 +186,60 @@ def _handle_check_result(future, path_info, incomplete, work_queue, checked, sta
     return checked
 
 
+# Generic KV-table helpers to reduce duplication across different tracking tables
+
+def _init_kv_db(conn, table_name, extra_columns_sql):
+    """Initialize a KV SQLite table with a filepath primary key and extra columns.
+
+    extra_columns_sql should be a comma-separated SQL fragment like "mtime REAL NOT NULL, size INTEGER NOT NULL".
+    """
+    cur = conn.cursor()
+    cur.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (filepath TEXT PRIMARY KEY, {extra_columns_sql})")
+
+
+def _get_kv_row(conn, table_name, filepath, columns):
+    """Return a tuple of columns from table_name for filepath, or None."""
+    cur = conn.cursor()
+    cols_sql = ", ".join(columns)
+    cur.execute(f"SELECT {cols_sql} FROM {table_name} WHERE filepath = ?", (filepath,))
+    row = cur.fetchone()
+    return tuple(row) if row else None
+
+
+def _set_kv_row(conn, table_name, filepath, columns_values):
+    """Insert or replace a KV row. columns_values is an ordered dict-like sequence of (col, val)."""
+    cur = conn.cursor()
+    cols = [c for c, _ in columns_values]
+    vals = [v for _, v in columns_values]
+    placeholders = ", ".join(["?" for _ in vals])
+    cols_sql = ", ".join(cols)
+    cur.execute(f"INSERT OR REPLACE INTO {table_name} (filepath, {cols_sql}) VALUES (?, {placeholders})", (filepath, *vals))
+
+
+def _prune_kv_missing(conn, table_name):
+    """Delete rows in table_name where filepath no longer exists on disk."""
+    cur = conn.cursor()
+    cur.execute(f"SELECT filepath FROM {table_name}")
+    rows = cur.fetchall()
+    to_delete = []
+    for (fp,) in rows:
+        if not os.path.exists(fp):
+            to_delete.append(fp)
+    if to_delete:
+        cur.executemany(f"DELETE FROM {table_name} WHERE filepath = ?", [(fp,) for fp in to_delete])
+
+
 def init_mtime_db(db_path):
     """Create/open the mtime tracking DB and ensure schema exists. Returns sqlite3.Connection."""
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS file_mtime_tracking (
-        filepath TEXT PRIMARY KEY,
-        mtime REAL NOT NULL,
-        size INTEGER NOT NULL
-    )
-    """)
+    _init_kv_db(conn, "file_mtime_tracking", "mtime REAL NOT NULL, size INTEGER NOT NULL")
     conn.commit()
     return conn
 
 
 def get_tracked_mtime(conn, filepath):
     """Return (mtime, size) tuple or None. May raise sqlite3.Error."""
-    cur = conn.cursor()
-    cur.execute("SELECT mtime, size FROM file_mtime_tracking WHERE filepath = ?", (filepath,))
-    row = cur.fetchone()
-    return (row[0], row[1]) if row else None
+    return _get_kv_row(conn, "file_mtime_tracking", filepath, ["mtime", "size"])
 
 
 def update_mtime_tracking(conn, filepath, mtime, size):
@@ -215,8 +248,7 @@ def update_mtime_tracking(conn, filepath, mtime, size):
     NOTE: this function does NOT call conn.commit() to allow batching of
     multiple updates. Call commit_mtime_db(conn) after a batch completes.
     """
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO file_mtime_tracking (filepath, mtime, size) VALUES (?, ?, ?)", (filepath, mtime, size))
+    _set_kv_row(conn, "file_mtime_tracking", filepath, [("mtime", mtime), ("size", size)])
 
 
 def commit_mtime_db(conn):
@@ -226,15 +258,7 @@ def commit_mtime_db(conn):
 
 def prune_stale_mtime_rows(conn):
     """Remove tracking rows whose files no longer exist on disk."""
-    cur = conn.cursor()
-    cur.execute("SELECT filepath FROM file_mtime_tracking")
-    rows = cur.fetchall()
-    to_delete = []
-    for (fp,) in rows:
-        if not os.path.exists(fp):
-            to_delete.append(fp)
-    if to_delete:
-        cur.executemany("DELETE FROM file_mtime_tracking WHERE filepath = ?", [(fp,) for fp in to_delete])
+    _prune_kv_missing(conn, "file_mtime_tracking")
 
 
 def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None, mtime_db_path=None):
