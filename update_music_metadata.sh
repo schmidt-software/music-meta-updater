@@ -233,7 +233,8 @@ fi
 source "$VENV_DIR/bin/activate"
 log "Installing/updating Python dependencies..."
 run_logged pip install --upgrade pip
-run_logged pip install --upgrade beets mutagen requests pyacoustid
+# Install beets and common optional deps (beautifulsoup4 required by some fetchart providers)
+run_logged pip install --upgrade beets mutagen requests pyacoustid beautifulsoup4
 
 USE_CHROMA="no"
 if command -v fpcalc >/dev/null 2>&1 && [ -n "$ACOUSTID_API_KEY" ]; then
