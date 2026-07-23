@@ -73,6 +73,9 @@ LOG_FILE="$WORK_DIR/update.log"
 INCOMPLETE_LIST="$WORK_DIR/incomplete_files.lst"
 BEETS_IMPORT_LOG="$WORK_DIR/beets_import.log"
 METRICS_FILE="$WORK_DIR/metrics.json"
+# Optional DB path used by the scanner for incremental mtime tracking.
+# Defaults to $WORK_DIR/mtime.db but can be overridden via the MTIME_DB env var.
+MTIME_DB="${MTIME_DB:-$WORK_DIR/mtime.db}"
 
 mkdir -p "$WORK_DIR"
 
