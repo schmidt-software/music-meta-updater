@@ -36,7 +36,7 @@ services:
       # WEBHOOK_URL: https://your-webhook.example.com/notify
     volumes:
       # Host's mounted music storage is mounted 1:1 into the container.
-      - ${MUSIC_HOST_PATH:-/path/to/music}:/music
+      - ${MUSIC_HOST_PATH:-./music}:/music
       # Persistent beets database + logs, so later runs don't
       # re-touch files that are already known.
       - music_metadata_data:/data
