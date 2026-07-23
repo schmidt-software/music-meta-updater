@@ -38,6 +38,9 @@ COPY entrypoint.sh /app/entrypoint.sh
 COPY scan_incomplete.py /app/scan_incomplete.py
 COPY tagging_modes.py /app/tagging_modes.py
 COPY metadata_fallback.py /app/metadata_fallback.py
+# Ensure utility modules required by the entrypoint and scripts are copied
+COPY schedule_utils.py /app/schedule_utils.py
+COPY cover_sources.py /app/cover_sources.py
 RUN chmod +x /app/update_music_metadata.sh /app/entrypoint.sh
 
 # Inside the container, the music folder is mounted at /music,
