@@ -121,16 +121,22 @@ def generate_beets_fetchart_config(sources):
         beets_sources = ["MusicBrainz"]
     
     # Generate YAML config
+    # Render sources as a YAML sequence (one per line) to avoid YAML parsing
+    # ambiguities that some beets versions may exhibit when given inline
+    # Python-like list syntax.
+    sources_yaml = "\n".join([f"  - {s}" for s in beets_sources])
+
     config = f"""fetchart:
   auto: yes
   force: no
   enforce_ratio: no
-  sources: {beets_sources}
+  sources:
+{sources_yaml}
   # Fallback behavior:
   # - cover_only: skip_cover=false (try all sources)
   # - strict/aggressive/default: all sources enabled
 """
-    
+
     return config
 
 
