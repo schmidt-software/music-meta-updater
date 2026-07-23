@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-venv \
         ca-certificates \
         curl \
+        bc \
     && rm -rf /var/lib/apt/lists/*
 
 # Install supercronic (lightweight cron scheduler for containers)
