@@ -92,14 +92,17 @@ def generate_beets_fetchart_config(sources):
     if not valid:
         raise ValueError(f"Invalid cover sources: {error}")
 
-    # Map source names to beets plugin names
+    # Map source names to beets fetchart source IDs (not human names).
+    # Use conservative defaults that are commonly available in beets.
     source_plugins = {
-        "musicbrainz": "MusicBrainz",
-        "amazon": "Amazon",
-        "discogs": "Discogs",
+        "musicbrainz": "coverart",   # Cover Art Archive (MusicBrainz)
+        "amazon": "amazon",
+        # Discogs isn't always provided by upstream beets; map to the
+        # AlbumArt.org scraper as a best-effort fallback.
+        "discogs": "albumart",
     }
 
-    # Build beets sources list
+    # Build beets sources list (IDs)
     beets_sources = []
     dropped = []
     for source in sources:
@@ -116,17 +119,18 @@ def generate_beets_fetchart_config(sources):
             file=sys.stderr,
         )
 
-    # If no valid beets sources, use default
+    # If no valid beets sources, use default ID 'coverart'
     if not beets_sources:
-        beets_sources = ["MusicBrainz"]
-    
-    # Generate YAML config
-    # Render sources as a YAML sequence (one per line) to avoid YAML parsing
-    # ambiguities that some beets versions may exhibit when given inline
-    # Python-like list syntax.
-    sources_yaml = "\n".join([f"  - {s}" for s in beets_sources])
+        beets_sources = ["coverart"]
 
-    config = f"""fetchart:
+    # Render as YAML mapping of source_id: "*" (default matching criteria),
+    # preserving a comment with human-readable names for operator clarity.
+    sources_yaml = "\n".join([f"    {s}: \"*\"" for s in beets_sources])
+
+    human_readable = ", ".join([s.title() for s in sources if s not in dropped])
+
+    config = f"""# Generated fetchart configuration (requested sources: {human_readable})
+fetchart:
   auto: yes
   force: no
   enforce_ratio: no
