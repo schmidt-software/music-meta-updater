@@ -26,6 +26,7 @@ import metadata_fallback
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
 
 DEFAULT_SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "8"))
+DEFAULT_UPDATER_WORKERS = int(os.environ.get("UPDATER_WORKERS", "1"))
 MTIME_TOLERANCE = float(os.environ.get("MTIME_TOLERANCE", "1.0"))  # seconds tolerance for mtime comparison on coarse filesystems
 
 
@@ -242,14 +243,24 @@ def _apply_fallback_tags(file_path, metadata):
         return False
 
 
-def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=None):
+def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=None, beets_lock=None):
     """Tags file_path via beets, then fetches and embeds cover art for just
-    that item (scoped via a "path:" query). Runs from a single dedicated
-    worker (see _updater_worker) since beets' sqlite library isn't safe for
-    concurrent writes from multiple beet processes at once.
+    that item (scoped via a "path:" query).
+
+    beets subprocesses are serialized with beets_lock (an RLock) so multiple
+    updater threads can prepare work concurrently but only one thread runs
+    beets at a time to avoid corrupting beets' SQLite DB.
     """
     print(f"Fetching metadata for: {file_path}", flush=True)
-    result = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
+
+    import_cmd = ["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path]
+    # Run import under the beets_lock if provided to serialize DB access
+    if beets_lock:
+        with beets_lock:
+            result = run(import_cmd)
+    else:
+        result = run(import_cmd)
+
     if result.returncode != 0:
         print(f"WARN: Could not automatically tag '{file_path}' (no confident match found).",
               file=sys.stderr, flush=True)
@@ -269,12 +280,21 @@ def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=
                     # Controlled rescan: opt-in via FALLBACK_BEETS_RESCAN (default: false)
                     rescan = os.environ.get('FALLBACK_BEETS_RESCAN', 'false').lower() in ('1', 'true', 'yes')
                     if rescan:
-                        result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
+                        if beets_lock:
+                            with beets_lock:
+                                result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
+                        else:
+                            result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
                         if result2.returncode == 0:
                             print(f"Metadata written after fallback: {file_path}", flush=True)
                             query = f"path:{file_path}"
-                            run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
-                            run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+                            if beets_lock:
+                                with beets_lock:
+                                    run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+                                    run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+                            else:
+                                run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+                                run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
                             print(f"Cover art updated: {file_path}", flush=True)
                             return True
                         else:
@@ -291,13 +311,18 @@ def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=
     print(f"Metadata written: {file_path}", flush=True)
 
     query = f"path:{file_path}"
-    run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
-    run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+    if beets_lock:
+        with beets_lock:
+            run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+            run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+    else:
+        run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+        run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
     print(f"Cover art updated: {file_path}", flush=True)
     return True
 
 
-def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None, music_dir=None, failed_conn=None, failed_db_lock=None):
+def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None, music_dir=None, failed_conn=None, failed_db_lock=None, beets_lock=None):
     """Consumes (path, mtime, size) tuples from work_queue one at a time until it
     sees the None sentinel. If mtime_conn is provided, successful updates
     are recorded to the mtime DB. Updates state for the heartbeat to report.
@@ -331,12 +356,16 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
             except Exception:
                 file_size = None
 
-        # Pass library_root to update_fn so fallback extraction can be scoped
+        # Pass library_root and beets_lock to update_fn so fallback extraction can be scoped
         try:
-            success = update_fn(file_path, beets_config_path, library_root=music_dir)
+            success = update_fn(file_path, beets_config_path, library_root=music_dir, beets_lock=beets_lock)
         except TypeError:
-            # Fallback: call without library_root if update_fn doesn't accept it
-            success = update_fn(file_path, beets_config_path)
+            # Fallback: call without beets_lock if update_fn doesn't accept it
+            try:
+                success = update_fn(file_path, beets_config_path, library_root=music_dir)
+            except TypeError:
+                # Older call signature: just pass file_path and beets_config_path
+                success = update_fn(file_path, beets_config_path)
         if success:
             state["updated"] += 1
             # Record tracked mtime and size only on confirmed success
@@ -730,9 +759,16 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
             failed_db_lock = None
 
     work_queue = queue.Queue()
-    updater_thread = threading.Thread(
-        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock, music_dir, failed_conn, failed_db_lock), daemon=True)
-    updater_thread.start()
+    updater_workers = DEFAULT_UPDATER_WORKERS
+    beets_lock = threading.RLock()
+    updater_threads = []
+    for _ in range(updater_workers):
+        t = threading.Thread(
+            target=_updater_worker,
+            args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock, music_dir, failed_conn, failed_db_lock, beets_lock),
+            daemon=True)
+        t.start()
+        updater_threads.append(t)
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_scan_workers) as pool:
@@ -788,9 +824,11 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
                 checked = _handle_check_result(
                     future, done_info, incomplete, work_queue, checked, state)
     finally:
-        # Ensure the updater is told to stop and join, and that DB connection is closed
-        work_queue.put(None)
-        updater_thread.join()
+        # Ensure the updater(s) are told to stop and join, and that DB connection is closed
+        for _ in updater_threads:
+            work_queue.put(None)
+        for t in updater_threads:
+            t.join()
         stop_event.set()
         heartbeat_thread.join()
         if mtime_conn:
