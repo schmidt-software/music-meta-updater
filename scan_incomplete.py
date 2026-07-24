@@ -480,6 +480,12 @@ def init_failed_matches_db(db_path):
     return conn
 
 
+# Module-level lock to guard shared sqlite connection usage from multiple
+# threads. sqlite3 connections with check_same_thread=False can be used from
+# other threads, but cursors/execute must not be used concurrently.
+_FAILED_MATCHES_LOCK = threading.Lock()
+
+
 def record_failed_match(conn_or_path, filepath, error_reason):
     """Atomically increment or insert a failed_matches row for filepath.
 
@@ -495,20 +501,41 @@ def record_failed_match(conn_or_path, filepath, error_reason):
 
     try:
         now = time.time()
-        cur = conn.cursor()
-        # Atomic upsert increments match_attempts on conflict
-        cur.execute(
-            """INSERT INTO failed_matches (filepath, error_reason, match_attempts, last_attempt_time)
-               VALUES (?, ?, 1, ?)
-               ON CONFLICT(filepath) DO UPDATE SET
-                   match_attempts = failed_matches.match_attempts + 1,
-                   error_reason = excluded.error_reason,
-                   last_attempt_time = excluded.last_attempt_time
-            """,
-            (filepath, error_reason, now),
-        )
+        # Use a lock when using a shared connection to avoid concurrent
+        # cursor/execute calls which sqlite3 doesn't allow.
         if transient:
-            conn.commit()
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO failed_matches (filepath, error_reason, match_attempts, last_attempt_time)
+                   VALUES (?, ?, 1, ?)
+                   ON CONFLICT(filepath) DO UPDATE SET
+                       match_attempts = failed_matches.match_attempts + 1,
+                       error_reason = excluded.error_reason,
+                       last_attempt_time = excluded.last_attempt_time
+                """,
+                (filepath, error_reason, now),
+            )
+            try:
+                conn.commit()
+            except Exception:
+                pass
+        else:
+            with _FAILED_MATCHES_LOCK:
+                cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO failed_matches (filepath, error_reason, match_attempts, last_attempt_time)
+                       VALUES (?, ?, 1, ?)
+                       ON CONFLICT(filepath) DO UPDATE SET
+                           match_attempts = failed_matches.match_attempts + 1,
+                           error_reason = excluded.error_reason,
+                           last_attempt_time = excluded.last_attempt_time
+                    """,
+                    (filepath, error_reason, now),
+                )
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
     finally:
         if transient:
             try:
