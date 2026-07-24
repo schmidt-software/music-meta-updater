@@ -210,6 +210,18 @@ environment:
 The JSON metrics are POSTed to the URL with `Content-Type: application/json`.
 Useful for Kubernetes Events, Alerting Systems, or Custom Dashboards.
 
+## Fallback metadata (automatic)
+
+When beets cannot confidently match a file, the tool can optionally attempt a path-based fallback to infer artist and album from the folder structure and apply those tags directly into the file before retrying beets import. This improves client-side grouping (e.g., Navidrome) for single-track "Unknown Album" cases.
+
+Environment variables:
+- FALLBACK_APPLY (default: true) — when true, apply path-based fallback tags automatically after a beets match failure. Set to "false" to disable automatic fallback tagging.
+- FAILED_MATCH_DB (optional) — path to an SQLite DB file where failed (unmatched) files are recorded. If set, failures are recorded atomically in a failed_matches table for later inspection.
+
+Notes:
+- Automatic tagging uses Mutagen to write tags in-place. Back up your music before enabling wide-scale runs if you are concerned about incorrect tags.
+- The fallback heuristic is best-effort and conservative; it uses folder patterns like "Artist/Album" and "Artist - Album" and applies Unicode NFC normalization.
+
 ## Open items / possible next steps
 
 - Recurring execution (cron in the container, or external scheduling)
