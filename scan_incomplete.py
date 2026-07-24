@@ -21,6 +21,7 @@ except Exception:
     def MutagenFile(path, easy=False):
         return None
 
+import metadata_fallback
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
 
@@ -116,7 +117,132 @@ def _check_file(path):
     return "ok", None
 
 
-def _update_file(file_path, beets_config_path, run=subprocess.run):
+def _apply_fallback_tags(file_path, metadata):
+    """Apply artist/album tags into the file using Mutagen. Returns True on success.
+
+    After saving tags, update the file mtime so external tools (beets)
+    are more likely to notice the change without needing a full rescan.
+    Use format-specific Mutagen save APIs when available.
+    """
+    try:
+        ext = os.path.splitext(file_path)[1].lower()
+    except Exception:
+        ext = ''
+
+    # Try format-specific handlers first
+    try:
+        if ext == '.flac':
+            try:
+                import importlib
+                mod = importlib.import_module('mutagen.flac')
+                FLAC = getattr(mod, 'FLAC')
+                fl = FLAC(file_path)
+                if 'artist' in metadata and metadata['artist']:
+                    fl['artist'] = [metadata['artist']]
+                if 'album' in metadata and metadata['album']:
+                    fl['album'] = [metadata['album']]
+                fl.save()
+                try:
+                    os.utime(file_path, None)
+                except Exception:
+                    pass
+                print(f"Fallback tags applied (FLAC): {file_path}", flush=True)
+                return True
+            except Exception:
+                # Fall through to generic path
+                pass
+
+        if ext in ('.m4a', '.mp4'):
+            try:
+                import importlib
+                mod = importlib.import_module('mutagen.mp4')
+                MP4 = getattr(mod, 'MP4')
+                mp4 = MP4(file_path)
+                if 'artist' in metadata and metadata['artist']:
+                    mp4['\xa9ART'] = [metadata['artist']]
+                if 'album' in metadata and metadata['album']:
+                    mp4['\xa9alb'] = [metadata['album']]
+                mp4.save()
+                try:
+                    os.utime(file_path, None)
+                except Exception:
+                    pass
+                print(f"Fallback tags applied (MP4/M4A): {file_path}", flush=True)
+                return True
+            except Exception:
+                # Fall through to generic path
+                pass
+    except Exception:
+        # Ignore format-specific import errors; try generic approach
+        pass
+
+    # Generic path using MutagenFile / Easy APIs
+    try:
+        mf = MutagenFile(file_path, easy=True)
+    except Exception:
+        mf = None
+    if mf is None:
+        return False
+    try:
+        # Mutagen Easy* interfaces accept lists for values
+        if 'artist' in metadata and metadata['artist']:
+            mf['artist'] = [metadata['artist']]
+        if 'album' in metadata and metadata['album']:
+            mf['album'] = [metadata['album']]
+
+        # Try multiple save strategies for different file types
+        saved = False
+        try:
+            save = getattr(mf, 'save', None)
+            if callable(save):
+                save()
+                saved = True
+        except Exception:
+            saved = False
+
+        if not saved:
+            try:
+                if hasattr(mf, 'tags') and mf.tags is not None and hasattr(mf.tags, 'save'):
+                    mf.tags.save()
+                    saved = True
+            except Exception:
+                saved = False
+
+        # As a last-ditch: re-open as easy and write back tags via Easy* API
+        if not saved:
+            try:
+                easy = MutagenFile(file_path, easy=True)
+                if easy is not None:
+                    if 'artist' in metadata and metadata['artist']:
+                        easy['artist'] = [metadata['artist']]
+                    if 'album' in metadata and metadata['album']:
+                        easy['album'] = [metadata['album']]
+                    save2 = getattr(easy, 'save', None)
+                    if callable(save2):
+                        save2()
+                        saved = True
+            except Exception:
+                saved = False
+
+        if not saved:
+            print(f"WARN: could not save tags with Mutagen for {file_path}", file=sys.stderr, flush=True)
+            return False
+
+        # Touch file mtime so other tools notice change
+        try:
+            os.utime(file_path, None)
+        except Exception:
+            # Not critical; log and continue
+            print(f"WARN: could not update mtime for {file_path}", file=sys.stderr, flush=True)
+
+        print(f"Fallback tags applied: {file_path}", flush=True)
+        return True
+    except Exception as e:
+        print(f"WARN: could not apply fallback tags to {file_path} ({e})", file=sys.stderr, flush=True)
+        return False
+
+
+def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=None):
     """Tags file_path via beets, then fetches and embeds cover art for just
     that item (scoped via a "path:" query). Runs from a single dedicated
     worker (see _updater_worker) since beets' sqlite library isn't safe for
@@ -127,6 +253,40 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
     if result.returncode != 0:
         print(f"WARN: Could not automatically tag '{file_path}' (no confident match found).",
               file=sys.stderr, flush=True)
+        # Attempt fallback metadata extraction and application if enabled
+        fallback_apply = os.environ.get('FALLBACK_APPLY', 'true').lower() not in ('0', 'false', 'no')
+        if fallback_apply:
+            library_root = os.environ.get('MUSIC_DIR')
+            try:
+                fb = metadata_fallback.extract_from_path(file_path, library_root=library_root)
+            except Exception as e:
+                fb = {}
+                print(f"WARN: fallback extraction failed for {file_path} ({e})", file=sys.stderr)
+            if fb:
+                # Apply normalized values (metadata_fallback already normalizes)
+                applied = _apply_fallback_tags(file_path, fb)
+                if applied:
+                    # Controlled rescan: opt-in via FALLBACK_BEETS_RESCAN (default: false)
+                    rescan = os.environ.get('FALLBACK_BEETS_RESCAN', 'false').lower() in ('1', 'true', 'yes')
+                    if rescan:
+                        result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
+                        if result2.returncode == 0:
+                            print(f"Metadata written after fallback: {file_path}", flush=True)
+                            query = f"path:{file_path}"
+                            run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+                            run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+                            print(f"Cover art updated: {file_path}", flush=True)
+                            return True
+                        else:
+                            print(f"WARN: beets still could not import {file_path} after fallback.", file=sys.stderr, flush=True)
+                            # Return False so future runs can retry the import
+                            return False
+                    else:
+                        # Rescan disabled: treat as successfully handled (tags applied)
+                        print(f"Fallback tags applied (rescan disabled): {file_path}", flush=True)
+                        return True
+                else:
+                    print(f"WARN: fallback extraction produced values but applying tags failed for {file_path}", file=sys.stderr, flush=True)
         return False
     print(f"Metadata written: {file_path}", flush=True)
 
@@ -137,7 +297,16 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
     return True
 
 
-def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None):
+def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None, music_dir=None, failed_conn=None, failed_db_lock=None):
+    """Consumes (path, mtime, size) tuples from work_queue one at a time until it
+    sees the None sentinel. If mtime_conn is provided, successful updates
+    are recorded to the mtime DB. Updates state for the heartbeat to report.
+
+    music_dir is passed to update_fn as library_root so fallback extraction
+    can be scoped relative to the library root, rather than reading MUSIC_DIR
+    from the environment.
+    """
+
     """Consumes (path, mtime, size) tuples from work_queue one at a time until it
     sees the None sentinel. If mtime_conn is provided, successful updates
     are recorded to the mtime DB. Updates state for the heartbeat to report."""
@@ -162,7 +331,12 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
             except Exception:
                 file_size = None
 
-        success = update_fn(file_path, beets_config_path)
+        # Pass library_root to update_fn so fallback extraction can be scoped
+        try:
+            success = update_fn(file_path, beets_config_path, library_root=music_dir)
+        except TypeError:
+            # Fallback: call without library_root if update_fn doesn't accept it
+            success = update_fn(file_path, beets_config_path)
         if success:
             state["updated"] += 1
             # Record tracked mtime and size only on confirmed success
@@ -173,6 +347,17 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
                     print(f"WARN: could not update mtime DB for {file_path} ({e})", file=sys.stderr)
         else:
             state["failed"] += 1
+            # If configured, record the failed match into the failed_matches DB
+            if failed_conn:
+                try:
+                    reason = "no_confident_match"
+                    if failed_db_lock:
+                        with failed_db_lock:
+                            record_failed_match(failed_conn, file_path, reason)
+                    else:
+                        record_failed_match(failed_conn, file_path, reason)
+                except Exception as e:
+                    print(f"WARN: could not record failed match for {file_path} ({e})", file=sys.stderr)
         work_queue.task_done()
 
 
@@ -397,6 +582,107 @@ def mark_cover_processed(conn_or_path, records):
                 pass
 
 
+def init_failed_matches_db(db_path):
+    """Create/open the failed_matches DB and ensure schema exists. Returns sqlite3.Connection."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS failed_matches (
+            filepath TEXT PRIMARY KEY,
+            error_reason TEXT NOT NULL,
+            match_attempts INTEGER NOT NULL,
+            last_attempt_time REAL NOT NULL
+        )"""
+    )
+    conn.commit()
+    return conn
+
+
+# Module-level lock to guard shared sqlite connection usage from multiple
+# threads. sqlite3 connections with check_same_thread=False can be used from
+# other threads, but cursors/execute must not be used concurrently.
+_FAILED_MATCHES_LOCK = threading.Lock()
+
+
+def record_failed_match(conn_or_path, filepath, error_reason):
+    """Atomically increment or insert a failed_matches row for filepath.
+
+    Accepts either a sqlite3.Connection or a DB path string. Uses a single
+    INSERT ... ON CONFLICT DO UPDATE statement to avoid TOCTOU races.
+    """
+    transient = False
+    if isinstance(conn_or_path, str):
+        conn = init_failed_matches_db(conn_or_path)
+        transient = True
+    else:
+        conn = conn_or_path
+
+    try:
+        now = time.time()
+        # Use a lock when using a shared connection to avoid concurrent
+        # cursor/execute calls which sqlite3 doesn't allow.
+        if transient:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO failed_matches (filepath, error_reason, match_attempts, last_attempt_time)
+                   VALUES (?, ?, 1, ?)
+                   ON CONFLICT(filepath) DO UPDATE SET
+                       match_attempts = failed_matches.match_attempts + 1,
+                       error_reason = excluded.error_reason,
+                       last_attempt_time = excluded.last_attempt_time
+                """,
+                (filepath, error_reason, now),
+            )
+            try:
+                conn.commit()
+            except Exception:
+                pass
+        else:
+            with _FAILED_MATCHES_LOCK:
+                cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO failed_matches (filepath, error_reason, match_attempts, last_attempt_time)
+                       VALUES (?, ?, 1, ?)
+                       ON CONFLICT(filepath) DO UPDATE SET
+                           match_attempts = failed_matches.match_attempts + 1,
+                           error_reason = excluded.error_reason,
+                           last_attempt_time = excluded.last_attempt_time
+                    """,
+                    (filepath, error_reason, now),
+                )
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+    finally:
+        if transient:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_failed_match(conn_or_path, filepath):
+    """Return (error_reason, match_attempts, last_attempt_time) or None."""
+    transient = False
+    if isinstance(conn_or_path, str):
+        conn = init_failed_matches_db(conn_or_path)
+        transient = True
+    else:
+        conn = conn_or_path
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT error_reason, match_attempts, last_attempt_time FROM failed_matches WHERE filepath = ?", (filepath,))
+        row = cur.fetchone()
+        return tuple(row) if row else None
+    finally:
+        if transient:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None, mtime_db_path=None):
     """Walks music_dir with a pool of worker threads (I/O-bound file checks
     benefit from concurrency, especially on network mounts), dispatching
@@ -430,9 +716,22 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
             mtime_conn = None
             db_lock = None
 
+    # Optional failed_matches DB path via env var FAILED_MATCH_DB
+    failed_conn = None
+    failed_db_lock = None
+    failed_db_path = os.environ.get('FAILED_MATCH_DB')
+    if failed_db_path:
+        try:
+            failed_conn = init_failed_matches_db(failed_db_path)
+            failed_db_lock = threading.Lock()
+        except sqlite3.Error as e:
+            print(f"WARN: could not open failed matches DB {failed_db_path} ({e})", file=sys.stderr)
+            failed_conn = None
+            failed_db_lock = None
+
     work_queue = queue.Queue()
     updater_thread = threading.Thread(
-        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock), daemon=True)
+        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock, music_dir, failed_conn, failed_db_lock), daemon=True)
     updater_thread.start()
 
     try:
@@ -507,6 +806,11 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
                 except sqlite3.Error:
                     pass
                 mtime_conn.close()
+            except Exception:
+                pass
+        if failed_conn:
+            try:
+                failed_conn.close()
             except Exception:
                 pass
 
