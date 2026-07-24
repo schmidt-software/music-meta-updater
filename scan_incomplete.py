@@ -122,7 +122,61 @@ def _apply_fallback_tags(file_path, metadata):
 
     After saving tags, update the file mtime so external tools (beets)
     are more likely to notice the change without needing a full rescan.
+    Use format-specific Mutagen save APIs when available.
     """
+    try:
+        ext = os.path.splitext(file_path)[1].lower()
+    except Exception:
+        ext = ''
+
+    # Try format-specific handlers first
+    try:
+        if ext == '.flac':
+            try:
+                import importlib
+                mod = importlib.import_module('mutagen.flac')
+                FLAC = getattr(mod, 'FLAC')
+                fl = FLAC(file_path)
+                if 'artist' in metadata and metadata['artist']:
+                    fl['artist'] = [metadata['artist']]
+                if 'album' in metadata and metadata['album']:
+                    fl['album'] = [metadata['album']]
+                fl.save()
+                try:
+                    os.utime(file_path, None)
+                except Exception:
+                    pass
+                print(f"Fallback tags applied (FLAC): {file_path}", flush=True)
+                return True
+            except Exception:
+                # Fall through to generic path
+                pass
+
+        if ext in ('.m4a', '.mp4'):
+            try:
+                import importlib
+                mod = importlib.import_module('mutagen.mp4')
+                MP4 = getattr(mod, 'MP4')
+                mp4 = MP4(file_path)
+                if 'artist' in metadata and metadata['artist']:
+                    mp4['\xa9ART'] = [metadata['artist']]
+                if 'album' in metadata and metadata['album']:
+                    mp4['\xa9alb'] = [metadata['album']]
+                mp4.save()
+                try:
+                    os.utime(file_path, None)
+                except Exception:
+                    pass
+                print(f"Fallback tags applied (MP4/M4A): {file_path}", flush=True)
+                return True
+            except Exception:
+                # Fall through to generic path
+                pass
+    except Exception:
+        # Ignore format-specific import errors; try generic approach
+        pass
+
+    # Generic path using MutagenFile / Easy APIs
     try:
         mf = MutagenFile(file_path, easy=True)
     except Exception:
@@ -212,17 +266,25 @@ def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=
                 # Apply normalized values (metadata_fallback already normalizes)
                 applied = _apply_fallback_tags(file_path, fb)
                 if applied:
-                    # Try beets import again once after applying fallback tags
-                    result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
-                    if result2.returncode == 0:
-                        print(f"Metadata written after fallback: {file_path}", flush=True)
-                        query = f"path:{file_path}"
-                        run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
-                        run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
-                        print(f"Cover art updated: {file_path}", flush=True)
-                        return True
+                    # Controlled rescan: opt-in via FALLBACK_BEETS_RESCAN (default: false)
+                    rescan = os.environ.get('FALLBACK_BEETS_RESCAN', 'false').lower() in ('1', 'true', 'yes')
+                    if rescan:
+                        result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
+                        if result2.returncode == 0:
+                            print(f"Metadata written after fallback: {file_path}", flush=True)
+                            query = f"path:{file_path}"
+                            run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+                            run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+                            print(f"Cover art updated: {file_path}", flush=True)
+                            return True
+                        else:
+                            print(f"WARN: beets still could not import {file_path} after fallback.", file=sys.stderr, flush=True)
+                            # Return False so future runs can retry the import
+                            return False
                     else:
-                        print(f"WARN: beets still could not import {file_path} after fallback.", file=sys.stderr, flush=True)
+                        # Rescan disabled: treat as successfully handled (tags applied)
+                        print(f"Fallback tags applied (rescan disabled): {file_path}", flush=True)
+                        return True
                 else:
                     print(f"WARN: fallback extraction produced values but applying tags failed for {file_path}", file=sys.stderr, flush=True)
         return False
