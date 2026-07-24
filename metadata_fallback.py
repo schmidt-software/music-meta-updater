@@ -6,9 +6,13 @@ Implements heuristic-based metadata extraction from folder patterns like:
   Artist/Album/track.mp3
   Artist - Album/track.mp3
   etc.
+
+This module applies NFC Unicode normalization to extracted strings to
+avoid mismatches arising from filesystem-specific normalization forms.
 """
 import os
 import re
+import unicodedata
 
 # Disc/side/part/volume subfolders (e.g. "Disc 1", "Side A", "CD2", "Bonus")
 # that can sit *underneath* the real artist/album folder in multi-disc or
@@ -26,6 +30,12 @@ def _skip_disc_markers(path_parts):
     while parts and _DISC_MARKER_RE.match(parts[-1].strip()):
         parts.pop()
     return parts
+
+
+def _normalize(s):
+    if not s:
+        return s
+    return unicodedata.normalize("NFC", s).strip()
 
 
 def extract_from_path(filepath, library_root=None):
@@ -56,48 +66,49 @@ def extract_from_path(filepath, library_root=None):
     else:
         raw_path_parts = dirpath.split(os.sep)
 
+    # Remove empty / parent segments
     raw_path_parts = [p for p in raw_path_parts if p and p != os.pardir]
+    # Remove trailing disc/side markers
     path_parts = _skip_disc_markers(raw_path_parts)
 
     metadata = {}
     if not path_parts:
         return metadata
 
-    last_folder = path_parts[-1]
+    # Work with normalized folder names
+    norm_parts = [_normalize(p) for p in path_parts if p and not p.startswith('.')]
+    if not norm_parts:
+        return metadata
 
-    # Pattern: "Artist - Album"
+    last_folder = norm_parts[-1]
+
+    # Pattern: "Artist - Album" in a single folder name
     if " - " in last_folder:
-        parts = last_folder.split(" - ", 1)
-        metadata['artist'] = parts[0].strip()
-        metadata['album'] = parts[1].strip()
+        parts = [_normalize(x) for x in last_folder.split(" - ", 1)]
+        metadata['artist'] = parts[0]
+        metadata['album'] = parts[1]
         return metadata
 
     # Pattern: "Artist/track.mp3" (artist only) - only reachable when we
-    # can actually confirm there is exactly one folder level, i.e. a
-    # library_root was given.
-    if library_root and len(path_parts) == 1:
-        if last_folder and not last_folder.startswith('.'):
-            metadata['artist'] = last_folder.strip()
+    # can actually confirm there is exactly one folder level relative to
+    # the library root.
+    if library_root and len(norm_parts) == 1:
+        metadata['artist'] = last_folder
         return metadata
 
-    # Pattern: "Artist/Album"
-    if len(path_parts) >= 2:
-        second_last = path_parts[-2]
-        metadata['artist'] = second_last.strip()
-        metadata['album'] = last_folder.strip()
+    # Pattern: "Artist/Album" - take the last two meaningful folders
+    if len(norm_parts) >= 2:
+        metadata['artist'] = norm_parts[-2]
+        metadata['album'] = last_folder
         return metadata
 
-    # Last resort (no library_root given, so we can't distinguish an
-    # "artist only" folder from a mount-point/library-root segment):
-    # use the folder name as artist.
-    if last_folder and not last_folder.startswith('.'):
-        metadata['artist'] = last_folder.strip()
-
+    # Last resort: use last folder as artist
+    metadata['artist'] = last_folder
     return metadata
 
 
 if __name__ == "__main__":
-    # Test
+    # Smoke tests
     library_root = "/mnt/music"
     test_paths = [
         "/mnt/music/The Beatles/Abbey Road/01 - Come Together.mp3",

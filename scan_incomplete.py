@@ -21,6 +21,7 @@ except Exception:
     def MutagenFile(path, easy=False):
         return None
 
+import metadata_fallback
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus", ".wav", ".wma", ".aac"}
 
@@ -116,6 +117,35 @@ def _check_file(path):
     return "ok", None
 
 
+def _apply_fallback_tags(file_path, metadata):
+    """Apply artist/album tags into the file using Mutagen. Returns True on success."""
+    try:
+        mf = MutagenFile(file_path, easy=True)
+    except Exception:
+        mf = None
+    if mf is None:
+        return False
+    try:
+        # Mutagen Easy* interfaces accept lists for values
+        if 'artist' in metadata and metadata['artist']:
+            mf['artist'] = [metadata['artist']]
+        if 'album' in metadata and metadata['album']:
+            mf['album'] = [metadata['album']]
+        # Some Mutagen file types have a save() method
+        save = getattr(mf, 'save', None)
+        if callable(save):
+            save()
+        else:
+            # For safety, try to write tags via tags object if present
+            if hasattr(mf, 'tags') and mf.tags is not None:
+                mf.tags.save()
+        print(f"Fallback tags applied: {file_path}", flush=True)
+        return True
+    except Exception as e:
+        print(f"WARN: could not apply fallback tags to {file_path} ({e})", file=sys.stderr, flush=True)
+        return False
+
+
 def _update_file(file_path, beets_config_path, run=subprocess.run):
     """Tags file_path via beets, then fetches and embeds cover art for just
     that item (scoped via a "path:" query). Runs from a single dedicated
@@ -127,6 +157,32 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
     if result.returncode != 0:
         print(f"WARN: Could not automatically tag '{file_path}' (no confident match found).",
               file=sys.stderr, flush=True)
+        # Attempt fallback metadata extraction and application if enabled
+        fallback_apply = os.environ.get('FALLBACK_APPLY', 'true').lower() not in ('0', 'false', 'no')
+        if fallback_apply:
+            library_root = os.environ.get('MUSIC_DIR')
+            try:
+                fb = metadata_fallback.extract_from_path(file_path, library_root=library_root)
+            except Exception as e:
+                fb = {}
+                print(f"WARN: fallback extraction failed for {file_path} ({e})", file=sys.stderr)
+            if fb:
+                # Apply normalized values (metadata_fallback already normalizes)
+                applied = _apply_fallback_tags(file_path, fb)
+                if applied:
+                    # Try beets import again once after applying fallback tags
+                    result2 = run(["beet", "-v", "-c", beets_config_path, "import", "-q", "-s", file_path])
+                    if result2.returncode == 0:
+                        print(f"Metadata written after fallback: {file_path}", flush=True)
+                        query = f"path:{file_path}"
+                        run(["beet", "-v", "-c", beets_config_path, "fetchart", "-q", query])
+                        run(["beet", "-v", "-c", beets_config_path, "embedart", "-y", query])
+                        print(f"Cover art updated: {file_path}", flush=True)
+                        return True
+                    else:
+                        print(f"WARN: beets still could not import {file_path} after fallback.", file=sys.stderr, flush=True)
+                else:
+                    print(f"WARN: fallback extraction produced values but applying tags failed for {file_path}", file=sys.stderr, flush=True)
         return False
     print(f"Metadata written: {file_path}", flush=True)
 
