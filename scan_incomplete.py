@@ -118,7 +118,11 @@ def _check_file(path):
 
 
 def _apply_fallback_tags(file_path, metadata):
-    """Apply artist/album tags into the file using Mutagen. Returns True on success."""
+    """Apply artist/album tags into the file using Mutagen. Returns True on success.
+
+    After saving tags, update the file mtime so external tools (beets)
+    are more likely to notice the change without needing a full rescan.
+    """
     try:
         mf = MutagenFile(file_path, easy=True)
     except Exception:
@@ -131,14 +135,52 @@ def _apply_fallback_tags(file_path, metadata):
             mf['artist'] = [metadata['artist']]
         if 'album' in metadata and metadata['album']:
             mf['album'] = [metadata['album']]
-        # Some Mutagen file types have a save() method
-        save = getattr(mf, 'save', None)
-        if callable(save):
-            save()
-        else:
-            # For safety, try to write tags via tags object if present
-            if hasattr(mf, 'tags') and mf.tags is not None:
-                mf.tags.save()
+
+        # Try multiple save strategies for different file types
+        saved = False
+        try:
+            save = getattr(mf, 'save', None)
+            if callable(save):
+                save()
+                saved = True
+        except Exception:
+            saved = False
+
+        if not saved:
+            try:
+                if hasattr(mf, 'tags') and mf.tags is not None and hasattr(mf.tags, 'save'):
+                    mf.tags.save()
+                    saved = True
+            except Exception:
+                saved = False
+
+        # As a last-ditch: re-open as easy and write back tags via Easy* API
+        if not saved:
+            try:
+                easy = MutagenFile(file_path, easy=True)
+                if easy is not None:
+                    if 'artist' in metadata and metadata['artist']:
+                        easy['artist'] = [metadata['artist']]
+                    if 'album' in metadata and metadata['album']:
+                        easy['album'] = [metadata['album']]
+                    save2 = getattr(easy, 'save', None)
+                    if callable(save2):
+                        save2()
+                        saved = True
+            except Exception:
+                saved = False
+
+        if not saved:
+            print(f"WARN: could not save tags with Mutagen for {file_path}", file=sys.stderr, flush=True)
+            return False
+
+        # Touch file mtime so other tools notice change
+        try:
+            os.utime(file_path, None)
+        except Exception:
+            # Not critical; log and continue
+            print(f"WARN: could not update mtime for {file_path}", file=sys.stderr, flush=True)
+
         print(f"Fallback tags applied: {file_path}", flush=True)
         return True
     except Exception as e:
@@ -146,7 +188,7 @@ def _apply_fallback_tags(file_path, metadata):
         return False
 
 
-def _update_file(file_path, beets_config_path, run=subprocess.run):
+def _update_file(file_path, beets_config_path, run=subprocess.run, library_root=None):
     """Tags file_path via beets, then fetches and embeds cover art for just
     that item (scoped via a "path:" query). Runs from a single dedicated
     worker (see _updater_worker) since beets' sqlite library isn't safe for
@@ -193,7 +235,16 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
     return True
 
 
-def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None, failed_conn=None, failed_db_lock=None):
+def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None, music_dir=None, failed_conn=None, failed_db_lock=None):
+    """Consumes (path, mtime, size) tuples from work_queue one at a time until it
+    sees the None sentinel. If mtime_conn is provided, successful updates
+    are recorded to the mtime DB. Updates state for the heartbeat to report.
+
+    music_dir is passed to update_fn as library_root so fallback extraction
+    can be scoped relative to the library root, rather than reading MUSIC_DIR
+    from the environment.
+    """
+
     """Consumes (path, mtime, size) tuples from work_queue one at a time until it
     sees the None sentinel. If mtime_conn is provided, successful updates
     are recorded to the mtime DB. Updates state for the heartbeat to report."""
@@ -218,7 +269,12 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
             except Exception:
                 file_size = None
 
-        success = update_fn(file_path, beets_config_path)
+        # Pass library_root to update_fn so fallback extraction can be scoped
+        try:
+            success = update_fn(file_path, beets_config_path, library_root=music_dir)
+        except TypeError:
+            # Fallback: call without library_root if update_fn doesn't accept it
+            success = update_fn(file_path, beets_config_path)
         if success:
             state["updated"] += 1
             # Record tracked mtime and size only on confirmed success
@@ -613,7 +669,7 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
 
     work_queue = queue.Queue()
     updater_thread = threading.Thread(
-        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock, failed_conn, failed_db_lock), daemon=True)
+        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock, music_dir, failed_conn, failed_db_lock), daemon=True)
     updater_thread.start()
 
     try:
