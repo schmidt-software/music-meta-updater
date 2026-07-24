@@ -193,7 +193,7 @@ def _update_file(file_path, beets_config_path, run=subprocess.run):
     return True
 
 
-def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None):
+def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_conn=None, db_lock=None, failed_conn=None, failed_db_lock=None):
     """Consumes (path, mtime, size) tuples from work_queue one at a time until it
     sees the None sentinel. If mtime_conn is provided, successful updates
     are recorded to the mtime DB. Updates state for the heartbeat to report."""
@@ -229,6 +229,17 @@ def _updater_worker(work_queue, beets_config_path, state, update_fn=None, mtime_
                     print(f"WARN: could not update mtime DB for {file_path} ({e})", file=sys.stderr)
         else:
             state["failed"] += 1
+            # If configured, record the failed match into the failed_matches DB
+            if failed_conn:
+                try:
+                    reason = "no_confident_match"
+                    if failed_db_lock:
+                        with failed_db_lock:
+                            record_failed_match(failed_conn, file_path, reason)
+                    else:
+                        record_failed_match(failed_conn, file_path, reason)
+                except Exception as e:
+                    print(f"WARN: could not record failed match for {file_path} ({e})", file=sys.stderr)
         work_queue.task_done()
 
 
@@ -453,6 +464,80 @@ def mark_cover_processed(conn_or_path, records):
                 pass
 
 
+def init_failed_matches_db(db_path):
+    """Create/open the failed_matches DB and ensure schema exists. Returns sqlite3.Connection."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS failed_matches (
+            filepath TEXT PRIMARY KEY,
+            error_reason TEXT NOT NULL,
+            match_attempts INTEGER NOT NULL,
+            last_attempt_time REAL NOT NULL
+        )"""
+    )
+    conn.commit()
+    return conn
+
+
+def record_failed_match(conn_or_path, filepath, error_reason):
+    """Atomically increment or insert a failed_matches row for filepath.
+
+    Accepts either a sqlite3.Connection or a DB path string. Uses a single
+    INSERT ... ON CONFLICT DO UPDATE statement to avoid TOCTOU races.
+    """
+    transient = False
+    if isinstance(conn_or_path, str):
+        conn = init_failed_matches_db(conn_or_path)
+        transient = True
+    else:
+        conn = conn_or_path
+
+    try:
+        now = time.time()
+        cur = conn.cursor()
+        # Atomic upsert increments match_attempts on conflict
+        cur.execute(
+            """INSERT INTO failed_matches (filepath, error_reason, match_attempts, last_attempt_time)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT(filepath) DO UPDATE SET
+                   match_attempts = failed_matches.match_attempts + 1,
+                   error_reason = excluded.error_reason,
+                   last_attempt_time = excluded.last_attempt_time
+            """,
+            (filepath, error_reason, now),
+        )
+        if transient:
+            conn.commit()
+    finally:
+        if transient:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_failed_match(conn_or_path, filepath):
+    """Return (error_reason, match_attempts, last_attempt_time) or None."""
+    transient = False
+    if isinstance(conn_or_path, str):
+        conn = init_failed_matches_db(conn_or_path)
+        transient = True
+    else:
+        conn = conn_or_path
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT error_reason, match_attempts, last_attempt_time FROM failed_matches WHERE filepath = ?", (filepath,))
+        row = cur.fetchone()
+        return tuple(row) if row else None
+    finally:
+        if transient:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=None, mtime_db_path=None):
     """Walks music_dir with a pool of worker threads (I/O-bound file checks
     benefit from concurrency, especially on network mounts), dispatching
@@ -486,9 +571,22 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
             mtime_conn = None
             db_lock = None
 
+    # Optional failed_matches DB path via env var FAILED_MATCH_DB
+    failed_conn = None
+    failed_db_lock = None
+    failed_db_path = os.environ.get('FAILED_MATCH_DB')
+    if failed_db_path:
+        try:
+            failed_conn = init_failed_matches_db(failed_db_path)
+            failed_db_lock = threading.Lock()
+        except sqlite3.Error as e:
+            print(f"WARN: could not open failed matches DB {failed_db_path} ({e})", file=sys.stderr)
+            failed_conn = None
+            failed_db_lock = None
+
     work_queue = queue.Queue()
     updater_thread = threading.Thread(
-        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock), daemon=True)
+        target=_updater_worker, args=(work_queue, beets_config_path, state, None, mtime_conn, db_lock, failed_conn, failed_db_lock), daemon=True)
     updater_thread.start()
 
     try:
@@ -563,6 +661,11 @@ def scan_and_update(music_dir, beets_config_path, out_file, max_scan_workers=Non
                 except sqlite3.Error:
                     pass
                 mtime_conn.close()
+            except Exception:
+                pass
+        if failed_conn:
+            try:
+                failed_conn.close()
             except Exception:
                 pass
 

@@ -127,7 +127,12 @@ def generate_beets_fetchart_config(sources):
     # preserving a comment with human-readable names for operator clarity.
     sources_yaml = "\n".join([f"    {s}: \"*\"" for s in beets_sources])
 
-    human_readable = ", ".join([s.title() for s in sources if s not in dropped])
+    human_names = {
+        'musicbrainz': 'MusicBrainz',
+        'amazon': 'Amazon',
+        'discogs': 'Discogs',
+    }
+    human_readable = ", ".join([human_names.get(s, s.title()) for s in sources if s not in dropped])
 
     config = f"""# Generated fetchart configuration (requested sources: {human_readable})
 fetchart:
