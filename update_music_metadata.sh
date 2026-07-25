@@ -28,6 +28,9 @@
 #
 # Environment variables (optional):
 #   SCAN_WORKERS       -> parallel file-checking threads (default: 8)
+#   UPDATER_WORKERS    -> number of updater threads that can perform pre-processing
+#                         concurrently; beets subprocess calls remain serialized
+#                         to protect beets' SQLite DB (default: 1)
 #   WEBHOOK_URL        -> POST JSON health check to this URL on completion
 #                         (must be https://, must not point at a
 #                         loopback/private/link-local address)
@@ -76,6 +79,11 @@ METRICS_FILE="$WORK_DIR/metrics.json"
 # Optional DB path used by the scanner for incremental mtime tracking.
 # Defaults to $WORK_DIR/mtime.db but can be overridden via the MTIME_DB env var.
 MTIME_DB="${MTIME_DB:-$WORK_DIR/mtime.db}"
+
+# Updater worker count (controls how many updater threads run). The
+# Python scanner honors UPDATER_WORKERS environment variable; default 1
+# to preserve the existing serialized behavior.
+UPDATER_WORKERS="${UPDATER_WORKERS:-1}"
 
 mkdir -p "$WORK_DIR"
 
@@ -354,6 +362,7 @@ fi
 # item) right away instead of waiting for the whole scan to finish first.
 
 log "Scanning $MUSIC_DIR for files without cover art or metadata, updating as they're found..."
+log "Configuration: SCAN_WORKERS=${SCAN_WORKERS:-(python default)}, UPDATER_WORKERS=${UPDATER_WORKERS}"
 
 # Capture stdout to a temp file (in addition to the log) so the summary
 # line can be parsed afterwards for metrics.
