@@ -150,6 +150,19 @@ whole scan to finish first. A background heartbeat prints progress
 every few seconds so long-running scans on large/slow mounts don't
 look stuck.
 
+New: UPDATER_WORKERS (default: 1) controls the number of updater threads.
+These threads can perform per-file pre-processing (e.g., fallback tag
+application) concurrently, while all beets subprocess invocations remain
+serialized to protect the beets/SQLite DB. Use a value >1 to reduce idle
+preparation time when SCAN_WORKERS is high and your host has CPU/I/O to
+spare. Example:
+
+```bash
+SCAN_WORKERS=32 UPDATER_WORKERS=4 MUSIC_DIR=/music ./update_music_metadata.sh
+```
+
+Tune UPDATER_WORKERS gradually; default 1 preserves prior safe behavior.
+
 Control the number of scan workers via the `SCAN_WORKERS` environment variable:
 
 ```bash
