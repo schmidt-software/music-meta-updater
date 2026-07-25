@@ -29,6 +29,9 @@ services:
       ACOUSTID_API_KEY: ${ACOUSTID_API_KEY:-}
       SCHEDULE: ${SCHEDULE:-}
       SCAN_WORKERS: ${SCAN_WORKERS:-8}
+      # Optional: number of updater threads that may run pre-processing in parallel.
+      # Beets DB writes remain serialized; default is 1 to preserve safety.
+      UPDATER_WORKERS: ${UPDATER_WORKERS:-1}
       # Optional tagging/monitoring tuning:
       # TAGGING_MODE: strict      # default, strict, aggressive, cover_only
       # STRONG_REC_THRESH: 0.85   # overrides TAGGING_MODE's preset if set
